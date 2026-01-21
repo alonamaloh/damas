@@ -1,5 +1,5 @@
 CXX = g++
-CXXFLAGS = -std=c++20 -O3 -march=native -Wall -Wextra -pedantic -mbmi2
+CXXFLAGS = -std=c++20 -O3 -march=native -Wall -Wextra -Werror -pedantic -mbmi2
 OMPFLAGS = -fopenmp
 
 SRCS = board.cpp movegen.cpp notation.cpp tablebase.cpp

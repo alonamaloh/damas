@@ -33,7 +33,6 @@ struct Stats {
 
 // Global tablebase storage (protected by mutex for writes)
 std::unordered_map<Material, std::vector<Value>> g_wdl_tablebases;
-std::unordered_map<Material, std::vector<DTM>> g_dtm_tablebases;
 std::mutex g_tablebases_mutex;
 
 // Thread-safe read: returns a copy of the tablebase (or empty if not found)
@@ -43,32 +42,10 @@ std::vector<Value> get_wdl_tablebase(const Material& m) {
   return (it != g_wdl_tablebases.end()) ? it->second : std::vector<Value>{};
 }
 
-std::vector<DTM> get_dtm_tablebase(const Material& m) {
-  std::lock_guard<std::mutex> lock(g_tablebases_mutex);
-  auto it = g_dtm_tablebases.find(m);
-  return (it != g_dtm_tablebases.end()) ? it->second : std::vector<DTM>{};
-}
-
-// Thread-safe check if tablebase exists
-bool has_wdl_tablebase(const Material& m) {
-  std::lock_guard<std::mutex> lock(g_tablebases_mutex);
-  return g_wdl_tablebases.find(m) != g_wdl_tablebases.end();
-}
-
-bool has_dtm_tablebase(const Material& m) {
-  std::lock_guard<std::mutex> lock(g_tablebases_mutex);
-  return g_dtm_tablebases.find(m) != g_dtm_tablebases.end();
-}
-
 // Thread-safe write: stores tablebase
 void store_wdl_tablebase(const Material& m, std::vector<Value>&& table) {
   std::lock_guard<std::mutex> lock(g_tablebases_mutex);
   g_wdl_tablebases[m] = std::move(table);
-}
-
-void store_dtm_tablebase(const Material& m, std::vector<DTM>&& table) {
-  std::lock_guard<std::mutex> lock(g_tablebases_mutex);
-  g_dtm_tablebases[m] = std::move(table);
 }
 
 // Build local sub_tablebases from dependencies (for thread-local use)
@@ -77,18 +54,6 @@ std::unordered_map<Material, std::vector<Value>> build_local_wdl_tablebases(
   std::unordered_map<Material, std::vector<Value>> local;
   for (const Material& dep : deps) {
     std::vector<Value> tb = get_wdl_tablebase(dep);
-    if (!tb.empty()) {
-      local[dep] = std::move(tb);
-    }
-  }
-  return local;
-}
-
-std::unordered_map<Material, std::vector<DTM>> build_local_dtm_tablebases(
-    const std::vector<Material>& deps) {
-  std::unordered_map<Material, std::vector<DTM>> local;
-  for (const Material& dep : deps) {
-    std::vector<DTM> tb = get_dtm_tablebase(dep);
     if (!tb.empty()) {
       local[dep] = std::move(tb);
     }
@@ -604,14 +569,6 @@ void solve_pair(const Material& m1, const Material& m2,
 // ============================================================================
 // Thread-Safe Parallel Solvers (for OpenMP parallelization)
 // ============================================================================
-
-// Check if material exists in a vector
-bool contains(const std::vector<Material>& vec, const Material& m) {
-  for (const Material& x : vec) {
-    if (x == m) return true;
-  }
-  return false;
-}
 
 // Thread-safe solve for a single symmetric material
 // Uses global g_wdl_tablebases and builds local copies of dependencies
