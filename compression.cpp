@@ -12,6 +12,11 @@ std::vector<std::uint8_t> compress_huffman_rle(const Value* values, std::size_t 
 std::vector<Value> decompress_huffman_rle(const std::uint8_t* data, std::size_t data_size,
                                           std::size_t num_values, CompressionMethod method);
 
+// Forward declarations for optimized 2-value RLE
+std::vector<std::uint8_t> compress_rle_huffman_2val(const Value* values, std::size_t count);
+std::vector<Value> decompress_rle_huffman_2val(const std::uint8_t* data, std::size_t data_size,
+                                                std::size_t num_values);
+
 // ============================================================================
 // Don't-Care Position Detection (Stage 1)
 // ============================================================================
@@ -579,6 +584,129 @@ Value lookup_rle_binary_search(const std::uint8_t* data, std::size_t data_size, 
   return int_to_value(val);
 }
 
+// ============================================================================
+// Method 2: DEFAULT_EXCEPTIONS
+// Stores a default value plus a sorted list of exceptions.
+// Format:
+//   Byte 0: Default value (2 bits in low bits)
+//   Bytes 1-2: Number of exceptions (uint16_t, little-endian)
+//   Bytes 3+: Exceptions, each 2 bytes (14-bit index + 2-bit value)
+// ============================================================================
+
+std::vector<std::uint8_t> compress_default_exceptions(const Value* values, std::size_t count) {
+  if (count == 0) return {0, 0, 0};  // Default=0, 0 exceptions
+
+  // Count occurrences of each value to find the most common (default)
+  std::size_t value_counts[4] = {0, 0, 0, 0};
+  for (std::size_t i = 0; i < count; ++i) {
+    std::uint8_t v = value_to_int(values[i]);
+    value_counts[v]++;
+  }
+
+  // Find the most common value
+  std::uint8_t default_value = 0;
+  std::size_t max_count = value_counts[0];
+  for (std::uint8_t v = 1; v < 4; ++v) {
+    if (value_counts[v] > max_count) {
+      max_count = value_counts[v];
+      default_value = v;
+    }
+  }
+
+  // Collect exceptions (positions where value != default)
+  std::vector<std::uint16_t> exceptions;
+  exceptions.reserve(count - max_count);
+
+  for (std::size_t i = 0; i < count; ++i) {
+    std::uint8_t v = value_to_int(values[i]);
+    if (v != default_value) {
+      // Pack: 14-bit index (low bits) + 2-bit value (high bits)
+      std::uint16_t entry = (static_cast<std::uint16_t>(v) << 14) | static_cast<std::uint16_t>(i);
+      exceptions.push_back(entry);
+    }
+  }
+
+  // Build result: header (3 bytes) + exceptions (2 bytes each)
+  std::vector<std::uint8_t> result;
+  result.reserve(3 + exceptions.size() * 2);
+
+  // Byte 0: default value
+  result.push_back(default_value);
+
+  // Bytes 1-2: exception count
+  std::uint16_t num_exceptions = static_cast<std::uint16_t>(exceptions.size());
+  result.push_back(num_exceptions & 0xFF);
+  result.push_back((num_exceptions >> 8) & 0xFF);
+
+  // Exceptions (already sorted by index since we iterate in order)
+  for (std::uint16_t entry : exceptions) {
+    result.push_back(entry & 0xFF);
+    result.push_back((entry >> 8) & 0xFF);
+  }
+
+  return result;
+}
+
+std::vector<Value> decompress_default_exceptions(const std::uint8_t* data, std::size_t data_size, std::size_t num_values) {
+  if (data_size < 3) return std::vector<Value>(num_values, Value::UNKNOWN);
+
+  // Read header
+  std::uint8_t default_value = data[0] & 0x3;
+  std::uint16_t num_exceptions = data[1] | (data[2] << 8);
+
+  // Initialize all positions to default value
+  std::vector<Value> result(num_values, int_to_value(default_value));
+
+  // Apply exceptions
+  for (std::size_t i = 0; i < num_exceptions && (3 + i * 2 + 1) < data_size; ++i) {
+    std::uint16_t entry = data[3 + i * 2] | (data[3 + i * 2 + 1] << 8);
+    std::size_t idx = entry & 0x3FFF;
+    std::uint8_t val = (entry >> 14) & 0x3;
+
+    if (idx < num_values) {
+      result[idx] = int_to_value(val);
+    }
+  }
+
+  return result;
+}
+
+// Lookup a single value using binary search on exception list.
+Value lookup_default_exceptions(const std::uint8_t* data, std::size_t data_size, std::size_t index) {
+  if (data_size < 3) return Value::UNKNOWN;
+
+  // Read header
+  std::uint8_t default_value = data[0] & 0x3;
+  std::uint16_t num_exceptions = data[1] | (data[2] << 8);
+
+  if (num_exceptions == 0) {
+    return int_to_value(default_value);
+  }
+
+  // Binary search for this index in the exception list
+  const std::uint8_t* exceptions = data + 3;
+  std::size_t lo = 0, hi = num_exceptions;
+
+  while (lo < hi) {
+    std::size_t mid = lo + (hi - lo) / 2;
+    std::uint16_t entry = exceptions[mid * 2] | (exceptions[mid * 2 + 1] << 8);
+    std::size_t exc_idx = entry & 0x3FFF;
+
+    if (exc_idx == index) {
+      // Found it - return the exception value
+      std::uint8_t val = (entry >> 14) & 0x3;
+      return int_to_value(val);
+    } else if (exc_idx < index) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+
+  // Not found in exceptions - return default value
+  return int_to_value(default_value);
+}
+
 } // anonymous namespace
 
 std::vector<std::uint8_t> compress_block(
@@ -601,14 +729,16 @@ std::vector<std::uint8_t> compress_block(
       return compress_rle_binary_search(values, count);
 
     case CompressionMethod::DEFAULT_EXCEPTIONS:
-      // Not implemented yet - fall back to raw 2-bit
-      return compress_raw_2bit(values, count);
+      return compress_default_exceptions(values, count);
 
     case CompressionMethod::HUFFMAN_RLE_SHORT:
     case CompressionMethod::HUFFMAN_RLE_MEDIUM:
     case CompressionMethod::HUFFMAN_RLE_LONG:
     case CompressionMethod::HUFFMAN_RLE_VARIABLE:
       return compress_huffman_rle(values, count, method);
+
+    case CompressionMethod::RLE_HUFFMAN_2VAL:
+      return compress_rle_huffman_2val(values, count);
 
     default:
       return compress_raw_2bit(values, count);
@@ -632,14 +762,16 @@ std::vector<Value> decompress_block(
       return decompress_rle_binary_search(data, data_size, num_values);
 
     case CompressionMethod::DEFAULT_EXCEPTIONS:
-      // Not implemented yet - assume raw 2-bit
-      return decompress_raw_2bit(data, num_values);
+      return decompress_default_exceptions(data, data_size, num_values);
 
     case CompressionMethod::HUFFMAN_RLE_SHORT:
     case CompressionMethod::HUFFMAN_RLE_MEDIUM:
     case CompressionMethod::HUFFMAN_RLE_LONG:
     case CompressionMethod::HUFFMAN_RLE_VARIABLE:
       return decompress_huffman_rle(data, data_size, num_values, method);
+
+    case CompressionMethod::RLE_HUFFMAN_2VAL:
+      return decompress_rle_huffman_2val(data, data_size, num_values);
 
     default:
       return decompress_raw_2bit(data, num_values);
@@ -671,20 +803,48 @@ std::pair<CompressionMethod, std::vector<std::uint8_t>> compress_block_best(
     best_data = std::move(rle);
   }
 
-  // Try Huffman RLE methods (4-7)
-  // Only try if block has >= 2 runs (otherwise single-value block is handled specially)
-  constexpr CompressionMethod huffman_methods[] = {
-    CompressionMethod::HUFFMAN_RLE_SHORT,
-    CompressionMethod::HUFFMAN_RLE_MEDIUM,
-    CompressionMethod::HUFFMAN_RLE_LONG,
-    CompressionMethod::HUFFMAN_RLE_VARIABLE,
-  };
+  // Try Method 2: DEFAULT_EXCEPTIONS (always available)
+  auto def_exc = compress_default_exceptions(values, count);
+  if (def_exc.size() < best_data.size()) {
+    best_method = CompressionMethod::DEFAULT_EXCEPTIONS;
+    best_data = std::move(def_exc);
+  }
 
-  for (CompressionMethod method : huffman_methods) {
-    auto huffman = compress_huffman_rle(values, count, method);
-    if (huffman.size() < best_data.size()) {
-      best_method = method;
-      best_data = std::move(huffman);
+  // Count distinct values to determine which methods to try
+  bool seen[4] = {false, false, false, false};
+  int num_distinct = 0;
+  for (std::size_t i = 0; i < count && num_distinct <= 2; ++i) {
+    std::uint8_t v = value_to_int(values[i]);
+    if (!seen[v]) {
+      seen[v] = true;
+      num_distinct++;
+    }
+  }
+
+  // Try Method 8: RLE_HUFFMAN_2VAL (optimized for 2-value blocks)
+  if (num_distinct == 2) {
+    auto huffman_2val = compress_rle_huffman_2val(values, count);
+    if (huffman_2val.size() < best_data.size()) {
+      best_method = CompressionMethod::RLE_HUFFMAN_2VAL;
+      best_data = std::move(huffman_2val);
+    }
+  }
+
+  // Try Huffman RLE methods (4-7) for blocks with 3+ values
+  if (num_distinct >= 3) {
+    constexpr CompressionMethod huffman_methods[] = {
+      CompressionMethod::HUFFMAN_RLE_SHORT,
+      CompressionMethod::HUFFMAN_RLE_MEDIUM,
+      CompressionMethod::HUFFMAN_RLE_LONG,
+      CompressionMethod::HUFFMAN_RLE_VARIABLE,
+    };
+
+    for (CompressionMethod method : huffman_methods) {
+      auto huffman = compress_huffman_rle(values, count, method);
+      if (huffman.size() < best_data.size()) {
+        best_method = method;
+        best_data = std::move(huffman);
+      }
     }
   }
 
@@ -774,6 +934,36 @@ void BlockCache::clear() {
 // CompressedTablebase Creation and Lookup (Stage 3)
 // ============================================================================
 
+// Helper: extend runs through tense positions in a block.
+// Tense positions (where captures are available) can store any value since
+// lookup_wdl_with_search will compute the correct result by searching.
+// By extending runs through these positions, we get longer runs for better compression.
+static std::vector<Value> extend_tense_positions(
+    const Value* values,
+    std::size_t count,
+    std::size_t block_start_index,
+    const Material& m) {
+
+  std::vector<Value> result(count);
+  Value prev_value = values[0];  // Start with first value (may be wrong for tense first pos)
+
+  for (std::size_t i = 0; i < count; ++i) {
+    std::size_t global_idx = block_start_index + i;
+    Board board = index_to_board(global_idx, m);
+
+    if (has_captures(board)) {
+      // Tense position - extend previous run
+      result[i] = prev_value;
+    } else {
+      // Normal position - use actual value and update prev
+      result[i] = values[i];
+      prev_value = values[i];
+    }
+  }
+
+  return result;
+}
+
 CompressedTablebase compress_tablebase(
     const std::vector<Value>& values,
     const Material& m) {
@@ -794,8 +984,14 @@ CompressedTablebase compress_tablebase(
     // Record offset
     tb.block_offsets.push_back(static_cast<std::uint32_t>(tb.block_data.size()));
 
-    // Find best compression
-    auto [method, compressed] = compress_block_best(values.data() + block_start, num_values);
+    // Extend runs through tense positions for better compression.
+    // Tense positions (where captures available) don't need correct values stored
+    // since lookup_wdl_with_search will compute them by searching.
+    auto extended = extend_tense_positions(
+        values.data() + block_start, num_values, block_start, m);
+
+    // Find best compression using the extended values
+    auto [method, compressed] = compress_block_best(extended.data(), num_values);
 
     // Write block header: method (1 byte) + size (2 bytes) + data
     tb.block_data.push_back(static_cast<std::uint8_t>(method));
@@ -864,11 +1060,18 @@ Value lookup_compressed(
     return lookup_rle_binary_search(data, compressed_size, idx_in_block);
   }
 
+  if (method == CompressionMethod::DEFAULT_EXCEPTIONS) {
+    std::uint16_t compressed_size = block_ptr[1] | (block_ptr[2] << 8);
+    const std::uint8_t* data = block_ptr + 3;
+    return lookup_default_exceptions(data, compressed_size, idx_in_block);
+  }
+
   // For Huffman methods, use cache (sequential-access only)
   if (method == CompressionMethod::HUFFMAN_RLE_SHORT ||
       method == CompressionMethod::HUFFMAN_RLE_MEDIUM ||
       method == CompressionMethod::HUFFMAN_RLE_LONG ||
-      method == CompressionMethod::HUFFMAN_RLE_VARIABLE) {
+      method == CompressionMethod::HUFFMAN_RLE_VARIABLE ||
+      method == CompressionMethod::RLE_HUFFMAN_2VAL) {
     if (cache) {
       const std::vector<Value>* block = cache->get_or_decompress(block_idx, tb);
       if (block && idx_in_block < block->size()) {
@@ -903,27 +1106,100 @@ Value lookup_compressed(
   return Value::UNKNOWN;
 }
 
+// Internal recursive search for compressed tablebases.
+// Unlike search_wdl_internal which uses UNKNOWN as sentinel, this checks
+// has_captures() to determine if a position needs searching (since run-extended
+// compression stores possibly-wrong values for tense positions).
+static Value search_compressed_internal(
+    const Board& b,
+    const CompressedTablebase& tb,
+    BlockCache* cache,
+    std::unordered_set<std::uint64_t>& visited,
+    int depth) {
+
+  // Depth limit to prevent stack overflow
+  if (depth > 100) {
+    return Value::DRAW;
+  }
+
+  // Check for cycle (repetition = draw)
+  std::uint64_t hash = b.hash();
+  if (visited.count(hash)) {
+    return Value::DRAW;
+  }
+
+  // If this is not a tense position, return the stored value
+  if (!has_captures(b)) {
+    std::size_t idx = board_to_index(b, tb.material);
+    return lookup_compressed(tb, idx, cache);
+  }
+
+  // Mark as visited for cycle detection
+  visited.insert(hash);
+
+  // Generate capture moves (mandatory)
+  std::vector<Move> moves;
+  generateMoves(b, moves);
+
+  // No moves = loss
+  if (moves.empty()) {
+    visited.erase(hash);
+    return Value::LOSS;
+  }
+
+  // Minimax through captures
+  bool has_draw = false;
+
+  for (const Move& move : moves) {
+    Board next = makeMove(b, move);
+
+    // Terminal check: if opponent has no pieces, we win
+    if (next.white == 0) {
+      visited.erase(hash);
+      return Value::WIN;
+    }
+
+    // Check if material changed (sub-tablebase needed)
+    Material next_m = get_material(next);
+    if (!(next_m == flip(tb.material))) {
+      // Material changed - would need sub-tablebase lookup
+      // For now, conservatively return DRAW for such cases
+      has_draw = true;
+      continue;
+    }
+
+    // Recurse (note: after makeMove, perspective is flipped)
+    Value successor_value = search_compressed_internal(next, tb, cache, visited, depth + 1);
+
+    // If opponent loses, we win
+    if (successor_value == Value::LOSS) {
+      visited.erase(hash);
+      return Value::WIN;
+    }
+
+    if (successor_value == Value::DRAW) {
+      has_draw = true;
+    }
+  }
+
+  visited.erase(hash);
+  return has_draw ? Value::DRAW : Value::LOSS;
+}
+
 Value lookup_compressed_with_search(
     const Board& b,
     const CompressedTablebase& tb,
     BlockCache* cache) {
 
-  std::size_t idx = board_to_index(b, tb.material);
-  Value stored = lookup_compressed(tb, idx, cache);
-
-  // If not don't-care, return directly
-  if (stored != Value::UNKNOWN) {
-    return stored;
+  // If not a tense position, return the stored value directly
+  if (!has_captures(b)) {
+    std::size_t idx = board_to_index(b, tb.material);
+    return lookup_compressed(tb, idx, cache);
   }
 
-  // Need to search - for now, decompress entire tablebase and use existing search
-  // This is a simple implementation; could be optimized later
-  std::vector<Value> full_tb(tb.num_positions);
-  for (std::size_t i = 0; i < tb.num_positions; ++i) {
-    full_tb[i] = lookup_compressed(tb, i, cache);
-  }
-
-  return lookup_wdl_with_search(b, full_tb, tb.material);
+  // Tense position - need to search through captures
+  std::unordered_set<std::uint64_t> visited;
+  return search_compressed_internal(b, tb, cache, visited, 0);
 }
 
 // ============================================================================
@@ -1814,6 +2090,212 @@ std::vector<Value> decompress_huffman_rle(const std::uint8_t* data, std::size_t 
     // Update history
     prev_prev_value = prev_value;
     prev_value = run_value;
+  }
+
+  // Pad if needed
+  while (result.size() < num_values) {
+    result.push_back(Value::UNKNOWN);
+  }
+
+  return result;
+}
+
+// ============================================================================
+// Optimized Huffman RLE for 2-Value Blocks (Method 8)
+// ============================================================================
+//
+// Format (minimal overhead for 2-value blocks):
+//   Byte 0:     val_0 (bits 0-1) | val_1 (bits 2-3) | reserved (bits 4-7)
+//   Bytes 1-2:  run_count (uint16_t LE)
+//   Bytes 3-4:  bit_stream_bytes (uint16_t LE)
+//   Bytes 5+:   Huffman-encoded run lengths (values alternate automatically)
+//
+// Encoding scheme (optimized from 6-men EGTB statistics):
+//   0                       = length 1    (1 bit)   ~46%
+//   10                      = length 2    (2 bits)  ~18%
+//   110                     = length 3    (3 bits)  ~9%
+//   1110                    = length 4    (4 bits)  ~4%
+//   11110 + 2 bits          = length 5-8  (7 bits)  ~8%
+//   111110 + 3 bits         = length 9-16 (9 bits)  ~5%
+//   1111110 + 4 bits        = length 17-32 (11 bits) ~5%
+//   11111110 + 5 bits       = length 33-64 (13 bits) ~2%
+//   111111110 + 6 bits      = length 65-128 (15 bits) ~1%
+//   1111111110 + 7 bits     = length 129-256 (17 bits)
+//   11111111110 + 8 bits    = length 257-512 (19 bits)
+//   111111111110 + 9 bits   = length 513-1024 (21 bits)
+//   1111111111110 + 10 bits = length 1025-2048 (23 bits)
+//   11111111111110 + 14 bits = length 2049-16384 (28 bits)
+//
+// Expected: ~3.5 bits/run, ~0.24 bits/position (vs 2 bits/position for RAW_2BIT)
+
+std::vector<std::uint8_t> compress_rle_huffman_2val(const Value* values, std::size_t count) {
+  if (count == 0) return {};
+
+  // Extract runs
+  struct Run { std::size_t length; };
+  std::vector<Run> runs;
+  runs.reserve(count / 10);  // Estimate based on avg run length ~14
+
+  std::uint8_t first_value = value_to_int(values[0]);
+  std::uint8_t second_value = first_value;  // Will be set when we find a different value
+  std::size_t current_length = 1;
+
+  for (std::size_t i = 1; i < count; ++i) {
+    std::uint8_t v = value_to_int(values[i]);
+    if (v == value_to_int(values[i - 1])) {
+      current_length++;
+    } else {
+      runs.push_back({current_length});
+      if (second_value == first_value && v != first_value) {
+        second_value = v;
+      }
+      current_length = 1;
+    }
+  }
+  runs.push_back({current_length});
+
+  // Handle single-run case (all same value)
+  if (runs.size() == 1) {
+    std::vector<std::uint8_t> result(2);
+    result[0] = first_value & 0x3;
+    result[1] = 0;  // Marker for single-value block
+    return result;
+  }
+
+  // Encode runs using Huffman
+  BitWriter writer;
+
+  for (const Run& run : runs) {
+    std::size_t len = run.length;
+    if (len == 0) len = 1;
+
+    if (len == 1) {
+      writer.write(0b0, 1);
+    } else if (len == 2) {
+      writer.write(0b10, 2);
+    } else if (len == 3) {
+      writer.write(0b110, 3);
+    } else if (len == 4) {
+      writer.write(0b1110, 4);
+    } else if (len <= 8) {
+      writer.write((0b11110u << 2) | (len - 5), 7);
+    } else if (len <= 16) {
+      writer.write((0b111110u << 3) | (len - 9), 9);
+    } else if (len <= 32) {
+      writer.write((0b1111110u << 4) | (len - 17), 11);
+    } else if (len <= 64) {
+      writer.write((0b11111110u << 5) | (len - 33), 13);
+    } else if (len <= 128) {
+      writer.write((0b111111110u << 6) | (len - 65), 15);
+    } else if (len <= 256) {
+      writer.write((0b1111111110u << 7) | (len - 129), 17);
+    } else if (len <= 512) {
+      writer.write((0b11111111110u << 8) | (len - 257), 19);
+    } else if (len <= 1024) {
+      writer.write((0b111111111110u << 9) | (len - 513), 21);
+    } else if (len <= 2048) {
+      writer.write((0b1111111111110u << 10) | (len - 1025), 23);
+    } else {
+      // 2049-16384
+      len = std::min(len, std::size_t(16384));
+      writer.write(0b11111111111110u, 14);
+      writer.write(static_cast<std::uint32_t>(len - 2049), 14);
+    }
+  }
+
+  auto bits = writer.finish();
+
+  // Build result
+  std::vector<std::uint8_t> result;
+  result.reserve(5 + bits.size());
+
+  // Header byte: val_0 (bits 0-1) | val_1 (bits 2-3)
+  std::uint8_t header = (first_value & 0x3) | ((second_value & 0x3) << 2);
+  result.push_back(header);
+
+  // Run count
+  std::uint16_t run_count = static_cast<std::uint16_t>(runs.size());
+  result.push_back(run_count & 0xFF);
+  result.push_back((run_count >> 8) & 0xFF);
+
+  // Bit stream size
+  std::uint16_t bit_bytes = static_cast<std::uint16_t>(bits.size());
+  result.push_back(bit_bytes & 0xFF);
+  result.push_back((bit_bytes >> 8) & 0xFF);
+
+  // Bit stream
+  result.insert(result.end(), bits.begin(), bits.end());
+
+  return result;
+}
+
+std::vector<Value> decompress_rle_huffman_2val(const std::uint8_t* data, std::size_t data_size,
+                                                std::size_t num_values) {
+  if (num_values == 0 || data_size < 2) return std::vector<Value>(num_values, Value::UNKNOWN);
+
+  // Check for single-value block marker
+  if (data_size == 2 && data[1] == 0) {
+    std::uint8_t val = data[0] & 0x3;
+    return std::vector<Value>(num_values, int_to_value(val));
+  }
+
+  if (data_size < 5) return std::vector<Value>(num_values, Value::UNKNOWN);
+
+  // Parse header
+  std::uint8_t header = data[0];
+  std::uint8_t val_0 = header & 0x3;
+  std::uint8_t val_1 = (header >> 2) & 0x3;
+
+  std::uint16_t run_count = data[1] | (data[2] << 8);
+  std::uint16_t bit_bytes = data[3] | (data[4] << 8);
+
+  if (data_size < static_cast<std::size_t>(5) + bit_bytes) {
+    return std::vector<Value>(num_values, Value::UNKNOWN);
+  }
+
+  // Decode runs
+  BitReader reader(data + 5, bit_bytes);
+  std::vector<Value> result;
+  result.reserve(num_values);
+
+  std::uint8_t current_value = val_0;
+
+  for (std::uint16_t r = 0; r < run_count && result.size() < num_values; ++r) {
+    // Decode run length using Huffman
+    std::size_t run_length;
+
+    // Read prefix (count leading 1s until we hit a 0)
+    int prefix = 0;
+    while (reader.has_bits(1) && reader.read(1) == 1) {
+      prefix++;
+      if (prefix >= 14) break;
+    }
+
+    switch (prefix) {
+      case 0: run_length = 1; break;
+      case 1: run_length = 2; break;
+      case 2: run_length = 3; break;
+      case 3: run_length = 4; break;
+      case 4: run_length = 5 + reader.read(2); break;
+      case 5: run_length = 9 + reader.read(3); break;
+      case 6: run_length = 17 + reader.read(4); break;
+      case 7: run_length = 33 + reader.read(5); break;
+      case 8: run_length = 65 + reader.read(6); break;
+      case 9: run_length = 129 + reader.read(7); break;
+      case 10: run_length = 257 + reader.read(8); break;
+      case 11: run_length = 513 + reader.read(9); break;
+      case 12: run_length = 1025 + reader.read(10); break;
+      default: run_length = 2049 + reader.read(14); break;
+    }
+
+    // Add values
+    std::size_t to_add = std::min(run_length, num_values - result.size());
+    for (std::size_t i = 0; i < to_add; ++i) {
+      result.push_back(int_to_value(current_value));
+    }
+
+    // Alternate value for next run
+    current_value = (current_value == val_0) ? val_1 : val_0;
   }
 
   // Pad if needed

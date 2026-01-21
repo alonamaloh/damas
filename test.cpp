@@ -923,8 +923,7 @@ TEST(ternary_fallback_on_4_values) {
 }
 
 TEST(compress_block_best_selects_smallest) {
-  // Create a block where ternary is better than raw but RLE might win.
-  // With isolated value changes, RLE has many runs.
+  // Create a block where most values are the same with a few exceptions.
   std::vector<Value> values(100, Value::WIN);
   values[50] = Value::LOSS;
   values[75] = Value::DRAW;
@@ -934,9 +933,10 @@ TEST(compress_block_best_selects_smallest) {
   // Raw: 100/4 = 25 bytes
   // Ternary: 1 + 100/5 = 21 bytes
   // RLE: 5 runs (WIN->LOSS->WIN->DRAW->WIN) = 10 bytes
-  // RLE should be selected as smallest
-  ASSERT(method == CompressionMethod::RLE_BINARY_SEARCH);
-  ASSERT_EQ(data.size(), 10u);
+  // DEFAULT_EXCEPTIONS: 3 + 2*2 = 7 bytes (header + 2 exceptions)
+  // DEFAULT_EXCEPTIONS should be selected as smallest
+  ASSERT(method == CompressionMethod::DEFAULT_EXCEPTIONS);
+  ASSERT_EQ(data.size(), 7u);
 }
 
 TEST(block_indexing) {
@@ -997,25 +997,10 @@ TEST(lru_cache_eviction) {
 }
 
 TEST(compress_tablebase_roundtrip) {
-  // Test that compressing and looking up a tablebase works correctly
-  Material m{0, 0, 0, 0, 1, 1};  // KvK
-  std::vector<Value> original = load_tablebase(m);
-  if (original.empty()) {
-    std::cout << "(skipped - no tablebase) ";
-    return;
-  }
-
-  CompressedTablebase ctb = compress_tablebase(original, m);
-
-  // Verify all positions
-  for (std::size_t i = 0; i < original.size(); ++i) {
-    Value looked_up = lookup_compressed(ctb, i, nullptr);
-    ASSERT(looked_up == original[i]);
-  }
-}
-
-TEST(compressed_lookup_with_cache) {
-  // Test that cache-based lookup works
+  // Test that compressing and looking up a tablebase works correctly.
+  // Since tense positions may have their values modified during compression
+  // (to extend runs), we use lookup_compressed_with_search which handles
+  // tense positions by searching.
   Material m{0, 0, 0, 0, 1, 1};  // KvK
   std::vector<Value> original = load_tablebase(m);
   if (original.empty()) {
@@ -1026,9 +1011,33 @@ TEST(compressed_lookup_with_cache) {
   CompressedTablebase ctb = compress_tablebase(original, m);
   BlockCache cache(4);
 
-  // Look up all positions using cache
+  // Verify all positions using lookup_compressed_with_search
   for (std::size_t i = 0; i < original.size(); ++i) {
-    Value looked_up = lookup_compressed(ctb, i, &cache);
+    Board b = index_to_board(i, m);
+    Value looked_up = lookup_compressed_with_search(b, ctb, &cache);
+    ASSERT(looked_up == original[i]);
+  }
+}
+
+TEST(compressed_lookup_with_cache) {
+  // Test that cache-based lookup works.
+  // Since tense positions may have their values modified during compression
+  // (to extend runs), we use lookup_compressed_with_search which handles
+  // tense positions by searching.
+  Material m{0, 0, 0, 0, 1, 1};  // KvK
+  std::vector<Value> original = load_tablebase(m);
+  if (original.empty()) {
+    std::cout << "(skipped - no tablebase) ";
+    return;
+  }
+
+  CompressedTablebase ctb = compress_tablebase(original, m);
+  BlockCache cache(4);
+
+  // Look up all positions using cache and search
+  for (std::size_t i = 0; i < original.size(); ++i) {
+    Board b = index_to_board(i, m);
+    Value looked_up = lookup_compressed_with_search(b, ctb, &cache);
     ASSERT(looked_up == original[i]);
   }
 
@@ -1090,6 +1099,108 @@ TEST(compression_ratio_vs_raw) {
   // For WDL data, we should achieve at least 2x vs raw 1-byte-per-value
   // (since 2-bit encoding gives 4x, but block header adds overhead)
   ASSERT(stats.compression_ratio() > 2.0);
+}
+
+// ============================================================================
+// DEFAULT_EXCEPTIONS Tests
+// ============================================================================
+
+TEST(default_exceptions_roundtrip) {
+  // Test that DEFAULT_EXCEPTIONS compression round-trips correctly
+  // Create a block with mostly WIN and a few exceptions
+  std::vector<Value> values(1000, Value::WIN);
+  values[100] = Value::LOSS;
+  values[200] = Value::DRAW;
+  values[500] = Value::LOSS;
+  values[750] = Value::DRAW;
+  values[999] = Value::UNKNOWN;
+
+  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::DEFAULT_EXCEPTIONS);
+  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::DEFAULT_EXCEPTIONS);
+
+  ASSERT_EQ(decompressed.size(), values.size());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    ASSERT(decompressed[i] == values[i]);
+  }
+
+  // Header (3 bytes) + 5 exceptions (10 bytes) = 13 bytes
+  ASSERT_EQ(compressed.size(), 13u);
+}
+
+TEST(default_exceptions_all_same) {
+  // Test block with all same values (no exceptions)
+  std::vector<Value> values(500, Value::DRAW);
+
+  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::DEFAULT_EXCEPTIONS);
+  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::DEFAULT_EXCEPTIONS);
+
+  ASSERT_EQ(decompressed.size(), values.size());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    ASSERT(decompressed[i] == values[i]);
+  }
+
+  // Header (3 bytes) + 0 exceptions = 3 bytes
+  ASSERT_EQ(compressed.size(), 3u);
+}
+
+TEST(default_exceptions_lookup) {
+  // Test binary search lookup
+  std::vector<Value> values(1000, Value::WIN);
+  values[100] = Value::LOSS;
+  values[500] = Value::DRAW;
+  values[999] = Value::UNKNOWN;
+
+  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::DEFAULT_EXCEPTIONS);
+
+  // Create a mock compressed tablebase structure for testing lookup
+  CompressedTablebase tb;
+  tb.material = Material{0, 0, 0, 0, 1, 1};
+  tb.num_positions = static_cast<std::uint32_t>(values.size());
+  tb.num_blocks = 1;
+  tb.block_offsets.push_back(0);
+
+  // Block header: method (1 byte) + size (2 bytes) + data
+  tb.block_data.push_back(static_cast<std::uint8_t>(CompressionMethod::DEFAULT_EXCEPTIONS));
+  std::uint16_t size = static_cast<std::uint16_t>(compressed.size());
+  tb.block_data.push_back(size & 0xFF);
+  tb.block_data.push_back((size >> 8) & 0xFF);
+  tb.block_data.insert(tb.block_data.end(), compressed.begin(), compressed.end());
+
+  // Test lookups at default positions
+  ASSERT(lookup_compressed(tb, 0, nullptr) == Value::WIN);
+  ASSERT(lookup_compressed(tb, 50, nullptr) == Value::WIN);
+  ASSERT(lookup_compressed(tb, 200, nullptr) == Value::WIN);
+
+  // Test lookups at exception positions
+  ASSERT(lookup_compressed(tb, 100, nullptr) == Value::LOSS);
+  ASSERT(lookup_compressed(tb, 500, nullptr) == Value::DRAW);
+  ASSERT(lookup_compressed(tb, 999, nullptr) == Value::UNKNOWN);
+}
+
+TEST(default_exceptions_vs_rle) {
+  // Test case where DEFAULT_EXCEPTIONS beats RLE: sparse exceptions
+  std::vector<Value> values(1000, Value::WIN);
+  values[100] = Value::LOSS;
+  values[500] = Value::DRAW;
+
+  auto def_exc = compress_block(values.data(), values.size(), CompressionMethod::DEFAULT_EXCEPTIONS);
+  auto rle = compress_block(values.data(), values.size(), CompressionMethod::RLE_BINARY_SEARCH);
+
+  // DEFAULT_EXCEPTIONS: 3 + 2*2 = 7 bytes
+  // RLE: 5 runs = 10 bytes
+  ASSERT(def_exc.size() < rle.size());
+
+  // Test case where RLE beats DEFAULT_EXCEPTIONS: long runs
+  std::vector<Value> values2;
+  for (int i = 0; i < 500; ++i) values2.push_back(Value::WIN);
+  for (int i = 0; i < 500; ++i) values2.push_back(Value::LOSS);
+
+  auto def_exc2 = compress_block(values2.data(), values2.size(), CompressionMethod::DEFAULT_EXCEPTIONS);
+  auto rle2 = compress_block(values2.data(), values2.size(), CompressionMethod::RLE_BINARY_SEARCH);
+
+  // DEFAULT_EXCEPTIONS: 3 + 500*2 = 1003 bytes (500 exceptions)
+  // RLE: 2 runs = 4 bytes
+  ASSERT(rle2.size() < def_exc2.size());
 }
 
 TEST(rle_binary_search_roundtrip) {
@@ -1381,6 +1492,12 @@ int main() {
   RUN_TEST(compressed_lookup_with_cache);
   RUN_TEST(block_compression_stats);
   RUN_TEST(compression_ratio_vs_raw);
+
+  std::cout << "\nRunning DEFAULT_EXCEPTIONS compression tests:\n";
+  RUN_TEST(default_exceptions_roundtrip);
+  RUN_TEST(default_exceptions_all_same);
+  RUN_TEST(default_exceptions_lookup);
+  RUN_TEST(default_exceptions_vs_rle);
 
   std::cout << "\nRunning RLE compression tests:\n";
   RUN_TEST(rle_binary_search_roundtrip);

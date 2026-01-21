@@ -134,6 +134,7 @@ enum class CompressionMethod : std::uint8_t {
   HUFFMAN_RLE_MEDIUM = 5, // Huffman RLE optimized for medium runs (~50 avg)
   HUFFMAN_RLE_LONG = 6,   // Huffman RLE optimized for long runs (~200 avg)
   HUFFMAN_RLE_VARIABLE = 7, // Huffman RLE for geometric distribution
+  RLE_HUFFMAN_2VAL = 8,   // Optimized Huffman RLE for 2-value blocks
 };
 
 // Compressed block header
@@ -258,7 +259,7 @@ Value lookup_compressed_with_search(
 
 struct BlockCompressionStats {
   std::size_t total_blocks = 0;
-  std::size_t method_counts[8] = {0, 0, 0, 0, 0, 0, 0, 0};  // Count per method
+  std::size_t method_counts[16] = {0};  // Count per method
   std::size_t uncompressed_size = 0;
   std::size_t compressed_size = 0;
 
