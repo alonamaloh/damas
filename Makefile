@@ -5,7 +5,7 @@ OMPFLAGS = -fopenmp
 SRCS = board.cpp movegen.cpp notation.cpp tablebase.cpp
 OBJS = $(SRCS:.cpp=.o)
 
-all: damas test generate lookup verify
+all: damas test generate lookup verify longest_mate play_optimal
 
 damas: $(OBJS) main.o
 	$(CXX) $(CXXFLAGS) -o $@ $^
@@ -25,11 +25,17 @@ lookup: $(OBJS) lookup.o
 verify: $(OBJS) verify.o
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
+longest_mate: $(OBJS) longest_mate.o
+	$(CXX) $(CXXFLAGS) -o $@ $^
+
+play_optimal: $(OBJS) play_optimal.o
+	$(CXX) $(CXXFLAGS) -o $@ $^
+
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 clean:
-	rm -f *.o damas test generate lookup verify
+	rm -f *.o damas test generate lookup verify longest_mate play_optimal
 
 # Dependencies
 board.o: board.cpp board.h
@@ -41,5 +47,7 @@ test.o: test.cpp board.h movegen.h notation.h tablebase.h
 generate.o: generate.cpp tablebase.h board.h movegen.h
 lookup.o: lookup.cpp tablebase.h board.h
 verify.o: verify.cpp tablebase.h board.h movegen.h
+longest_mate.o: longest_mate.cpp tablebase.h board.h
+play_optimal.o: play_optimal.cpp tablebase.h board.h movegen.h notation.h
 
 .PHONY: all clean

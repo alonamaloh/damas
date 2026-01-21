@@ -33,14 +33,14 @@ DTM lookup_dtm(const Board& b) {
 }
 
 int main() {
-  // Investigate DTM error at index 70122 of material 001111
-  // White: 0x8080000, Black: 0x8001, Kings: 0x80001
-  // WDL: WIN, Expected DTM: 4, Got DTM: 6
+  // Lookup: WQ:1,3 WP:2 BQ:4 BP:9 white to move
+  // Human squares 1-32 -> code squares 0-31
+  // WQ on 1,3 -> code 0,2; WP on 2 -> code 1; BQ on 4 -> code 3; BP on 9 -> code 8
 
   Board b;
-  b.white = 0x8080000;
-  b.black = 0x8001;
-  b.kings = 0x80001;
+  b.white = (1u << 0) | (1u << 1) | (1u << 2);  // squares 1,2,3 -> 0,1,2
+  b.black = (1u << 3) | (1u << 8);               // squares 4,9 -> 3,8
+  b.kings = (1u << 0) | (1u << 2) | (1u << 3);   // queens at 1,3,4 -> 0,2,3
   b.n_reversible = 0;
 
   std::cout << "Board:\n" << b << std::endl;
