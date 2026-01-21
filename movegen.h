@@ -28,3 +28,6 @@ std::size_t generateFullMoves(const Board& board, std::vector<FullMove>& moves);
 // Perft: count leaf nodes at given depth (for testing/debugging)
 uint64_t perft(const Board& board, int depth);
 
+// Check if the position has captures available for the side to move
+bool has_captures(const Board& board);
+

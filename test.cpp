@@ -2,9 +2,12 @@
 #include "movegen.h"
 #include "notation.h"
 #include "tablebase.h"
+#include "compression.h"
 #include <iostream>
 #include <random>
 #include <sstream>
+#include <chrono>
+#include <iomanip>
 
 // Simple test framework
 static int tests_run = 0;
@@ -427,6 +430,422 @@ TEST(material_flip) {
 }
 
 // =============================================================================
+// Compression tests
+// =============================================================================
+
+TEST(has_captures_pawn) {
+  // White pawn on 8 (notation 9), black pawn on 12 (notation 13)
+  // Pawn can capture diagonally NW
+  Board b;
+  b.white = 1u << 8;
+  b.black = 1u << 12;
+  b.kings = 0;
+
+  ASSERT(has_captures(b));
+}
+
+TEST(has_captures_none) {
+  // White pawn on 8, black pawn far away on 28
+  Board b;
+  b.white = 1u << 8;
+  b.black = 1u << 28;
+  b.kings = 0;
+
+  ASSERT(!has_captures(b));
+}
+
+TEST(has_captures_queen) {
+  // White queen on 0, black pawn on 9, empty at 18
+  // Queen can capture along diagonal
+  Board b;
+  b.white = 1u << 0;
+  b.black = 1u << 9;
+  b.kings = 1u << 0;
+
+  ASSERT(has_captures(b));
+}
+
+TEST(is_dont_care_we_capture) {
+  // Position where we have a capture
+  Board b;
+  b.white = 1u << 8;
+  b.black = 1u << 12;
+  b.kings = 0;
+
+  ASSERT(is_dont_care(b));
+}
+
+TEST(is_dont_care_opponent_captures) {
+  // Test that positions where only opponent has captures are NOT don't-care
+  // (Changed from original plan to avoid long search chains)
+  //
+  // White queen at square 4, black queen at square 0
+  // We can't capture, but opponent could (if it were their turn)
+  Board b;
+  b.white = 1u << 4;   // White queen at square 4
+  b.black = 1u << 0;   // Black queen at square 0
+  b.kings = b.white | b.black;  // Both are queens
+
+  // Verify we don't have captures
+  ASSERT(!has_captures(b));
+
+  // Verify opponent would have captures (if it were their turn)
+  Board flipped = flip(b);
+  bool opp_captures = has_captures(flipped);
+  ASSERT(opp_captures);
+
+  // But this is NOT don't-care (conservative approach)
+  // We only mark positions where WE have captures as don't-care
+  ASSERT(!is_dont_care(b));
+}
+
+TEST(is_dont_care_quiet_position) {
+  // Position where neither side has captures - not don't care
+  // Place pieces far apart
+  Board b;
+  b.white = 1u << 0;   // Corner square
+  b.black = 1u << 31;  // Opposite corner
+  b.kings = (1u << 0) | (1u << 31);  // Both queens
+
+  // Queens are far apart, no captures possible
+  ASSERT(!has_captures(b));
+  ASSERT(!has_captures(flip(b)));
+  ASSERT(!is_dont_care(b));
+}
+
+TEST(compression_stats_kvk) {
+  // Test on KvK (Queen vs Queen) tablebase if available
+  Material m{0, 0, 0, 0, 1, 1};
+  std::vector<Value> tb = load_tablebase(m);
+
+  if (tb.empty()) {
+    std::cout << "(skipped - no tablebase) ";
+    return;
+  }
+
+  CompressionStats stats = analyze_compression(tb, m);
+
+  // Verify totals add up (only dont_care + real = total now)
+  ASSERT_EQ(stats.total_positions, tb.size());
+  ASSERT_EQ(stats.dont_care_positions + stats.real_positions, stats.total_positions);
+  ASSERT_EQ(stats.wins + stats.losses + stats.draws, stats.total_positions);
+
+  // In KvK, there should be some don't-care positions (captures possible)
+  // and some real positions
+  ASSERT(stats.dont_care_positions > 0);  // Should have some capture positions
+  ASSERT(stats.real_positions > 0);
+}
+
+TEST(mark_dont_care_roundtrip) {
+  // Test that marking don't-care and then looking up returns correct values
+  Material m{0, 0, 0, 0, 1, 1};
+  std::vector<Value> tb = load_tablebase(m);
+
+  if (tb.empty()) {
+    std::cout << "(skipped - no tablebase) ";
+    return;
+  }
+
+  CompressionStats stats;
+  std::vector<Value> marked = mark_dont_care_positions(tb, m, stats);
+
+  // Verify a sample of positions
+  std::mt19937 rng(54321);
+  int tested = 0;
+  int correct = 0;
+
+  for (int i = 0; i < 100; ++i) {
+    std::size_t idx = rng() % tb.size();
+    Board board = index_to_board(idx, m);
+
+    Value original = tb[idx];
+    Value looked_up = lookup_wdl_with_search(board, marked, m);
+
+    tested++;
+    if (original == looked_up) {
+      correct++;
+    }
+  }
+
+  // All lookups should return correct value
+  ASSERT_EQ(correct, tested);
+}
+
+TEST(lookup_search_correctness) {
+  // More thorough test: verify ALL positions in a small tablebase
+  Material m{0, 0, 0, 0, 1, 1};  // KvK
+  std::vector<Value> tb = load_tablebase(m);
+
+  if (tb.empty()) {
+    std::cout << "(skipped - no tablebase) ";
+    return;
+  }
+
+  CompressionStats stats;
+  std::vector<Value> marked = mark_dont_care_positions(tb, m, stats);
+
+  // Verify all positions
+  int errors = 0;
+  for (std::size_t idx = 0; idx < tb.size(); ++idx) {
+    Board board = index_to_board(idx, m);
+    Value original = tb[idx];
+    Value looked_up = lookup_wdl_with_search(board, marked, m);
+
+    if (original != looked_up) {
+      errors++;
+      if (errors <= 5) {
+        std::cerr << "Mismatch at idx " << idx << ": expected " << static_cast<int>(original)
+                  << " got " << static_cast<int>(looked_up) << "\n";
+      }
+    }
+  }
+
+  ASSERT_EQ(errors, 0);
+}
+
+// =============================================================================
+// Stage 2: Advanced compression tests
+// =============================================================================
+
+TEST(search_stats_tracking) {
+  // Test that search statistics are tracked correctly
+  Material m{0, 0, 0, 0, 1, 1};  // KvK
+  std::vector<Value> tb = load_tablebase(m);
+
+  if (tb.empty()) {
+    std::cout << "(skipped - no tablebase) ";
+    return;
+  }
+
+  CompressionStats cstats;
+  std::vector<Value> marked = mark_dont_care_positions(tb, m, cstats);
+
+  // Empty sub-tablebases for this test
+  std::unordered_map<Material, std::vector<Value>> sub_tbs;
+  SearchStats stats;
+
+  // Look up all positions and collect stats
+  for (std::size_t idx = 0; idx < tb.size(); ++idx) {
+    Board board = index_to_board(idx, m);
+    lookup_wdl_with_search(board, marked, m, sub_tbs, &stats);
+  }
+
+  // Verify stats are reasonable
+  ASSERT_EQ(stats.lookups, tb.size());
+  ASSERT_EQ(stats.direct_hits + stats.searches, stats.lookups);
+  ASSERT(stats.direct_hits > 0);  // Should have some direct hits
+  ASSERT(stats.searches > 0);     // Should have some searches
+  ASSERT(stats.terminal_wins > 0); // KvK has terminal wins (captures)
+}
+
+TEST(lookup_correctness_kvkk) {
+  // Test on K vs 2K (Queen vs 2 Queens) - larger tablebase
+  Material m{0, 0, 0, 0, 1, 2};  // 1 white queen, 2 black queens
+  std::vector<Value> tb = load_tablebase(m);
+
+  if (tb.empty()) {
+    std::cout << "(skipped - no tablebase) ";
+    return;
+  }
+
+  // Load required sub-tablebases
+  // After white captures: could go to KvK (if white captures one black queen)
+  // After black captures: could go to 0vKK (white eliminated - terminal)
+  std::unordered_map<Material, std::vector<Value>> sub_tbs;
+
+  Material kvk{0, 0, 0, 0, 1, 1};  // After white captures one black queen
+  std::vector<Value> kvk_tb = load_tablebase(kvk);
+  if (!kvk_tb.empty()) {
+    CompressionStats sub_stats;
+    sub_tbs[kvk] = mark_dont_care_positions(kvk_tb, kvk, sub_stats);
+  }
+
+  CompressionStats cstats;
+  std::vector<Value> marked = mark_dont_care_positions(tb, m, cstats);
+
+  // Test a sample of positions
+  std::mt19937 rng(98765);
+  int tested = 0;
+  int errors = 0;
+
+  for (int i = 0; i < 500 && i < static_cast<int>(tb.size()); ++i) {
+    std::size_t idx = rng() % tb.size();
+    Board board = index_to_board(idx, m);
+    Value original = tb[idx];
+    Value looked_up = lookup_wdl_with_search(board, marked, m, sub_tbs, nullptr);
+
+    tested++;
+    if (original != looked_up) errors++;
+  }
+
+  ASSERT_EQ(errors, 0);
+}
+
+TEST(lookup_correctness_multi_material) {
+  // Test correctness across multiple material configurations
+  // Use materials and their required sub-tablebases
+  struct TestCase {
+    Material m;
+    std::vector<Material> sub_materials;
+  };
+
+  std::vector<TestCase> test_cases = {
+    {{0, 0, 0, 0, 1, 1}, {}},  // KvK - no sub-TBs needed (captures are terminal)
+    {{0, 0, 0, 0, 2, 1}, {{0, 0, 0, 0, 1, 1}}},  // KKvK -> KvK after black captures
+    {{0, 0, 0, 0, 1, 2}, {{0, 0, 0, 0, 1, 1}}},  // KvKK -> KvK after white captures
+  };
+
+  int total_tested = 0;
+  int total_errors = 0;
+
+  for (const TestCase& tc : test_cases) {
+    std::vector<Value> tb = load_tablebase(tc.m);
+    if (tb.empty()) continue;
+
+    // Load sub-tablebases
+    std::unordered_map<Material, std::vector<Value>> sub_tbs;
+    for (const Material& sub_m : tc.sub_materials) {
+      std::vector<Value> sub_tb = load_tablebase(sub_m);
+      if (!sub_tb.empty()) {
+        CompressionStats sub_stats;
+        sub_tbs[sub_m] = mark_dont_care_positions(sub_tb, sub_m, sub_stats);
+      }
+    }
+
+    CompressionStats cstats;
+    std::vector<Value> marked = mark_dont_care_positions(tb, tc.m, cstats);
+
+    // Test a sample
+    std::mt19937 rng(12345);
+    for (int i = 0; i < 200 && i < static_cast<int>(tb.size()); ++i) {
+      std::size_t idx = rng() % tb.size();
+      Board board = index_to_board(idx, tc.m);
+      Value original = tb[idx];
+      Value looked_up = lookup_wdl_with_search(board, marked, tc.m, sub_tbs, nullptr);
+
+      total_tested++;
+      if (original != looked_up) total_errors++;
+    }
+  }
+
+  ASSERT(total_tested > 0);  // At least some tablebases should exist
+  ASSERT_EQ(total_errors, 0);
+}
+
+TEST(lookup_with_sub_tablebases) {
+  // Test lookup with sub-tablebase support
+  // Use KKvK (2 queens vs 1 queen) which can capture down to KvK or KvNothing
+  Material m{0, 0, 0, 0, 2, 1};  // 2 white queens, 1 black queen
+  std::vector<Value> tb = load_tablebase(m);
+
+  if (tb.empty()) {
+    std::cout << "(skipped - no tablebase) ";
+    return;
+  }
+
+  // Load sub-tablebases
+  std::unordered_map<Material, std::vector<Value>> sub_tbs;
+
+  // After white captures black's queen: KK vs nothing (terminal, no TB needed)
+  // After black captures one white queen: KvK
+  Material kvk{0, 0, 0, 0, 1, 1};
+  std::vector<Value> kvk_tb = load_tablebase(kvk);
+  if (!kvk_tb.empty()) {
+    CompressionStats sub_stats;
+    sub_tbs[kvk] = mark_dont_care_positions(kvk_tb, kvk, sub_stats);
+  }
+
+  CompressionStats cstats;
+  std::vector<Value> marked = mark_dont_care_positions(tb, m, cstats);
+
+  SearchStats stats;
+
+  // Test positions
+  std::mt19937 rng(11111);
+  int errors = 0;
+  int tested = 0;
+
+  for (int i = 0; i < 300 && i < static_cast<int>(tb.size()); ++i) {
+    std::size_t idx = rng() % tb.size();
+    Board board = index_to_board(idx, m);
+    Value original = tb[idx];
+    Value looked_up = lookup_wdl_with_search(board, marked, m, sub_tbs, &stats);
+
+    tested++;
+    if (original != looked_up) errors++;
+  }
+
+  ASSERT_EQ(errors, 0);
+  // With sub-tablebases, we should see some sub-TB lookups
+  // (may be 0 if all captures in sample lead to terminal positions)
+}
+
+TEST(search_performance_benchmark) {
+  // Benchmark search performance
+  Material m{0, 0, 0, 0, 1, 1};  // KvK
+  std::vector<Value> tb = load_tablebase(m);
+
+  if (tb.empty()) {
+    std::cout << "(skipped - no tablebase) ";
+    return;
+  }
+
+  CompressionStats cstats;
+  std::vector<Value> marked = mark_dont_care_positions(tb, m, cstats);
+
+  std::unordered_map<Material, std::vector<Value>> sub_tbs;
+  SearchStats stats;
+
+  auto start = std::chrono::high_resolution_clock::now();
+
+  // Look up all positions
+  for (std::size_t idx = 0; idx < tb.size(); ++idx) {
+    Board board = index_to_board(idx, m);
+    lookup_wdl_with_search(board, marked, m, sub_tbs, &stats);
+  }
+
+  auto end = std::chrono::high_resolution_clock::now();
+  auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+
+  // Print benchmark results
+  std::cout << "\n    [Benchmark: " << tb.size() << " lookups in "
+            << duration.count() / 1000.0 << "ms";
+  std::cout << ", " << std::fixed << std::setprecision(1)
+            << (1000000.0 * tb.size() / duration.count()) << " lookups/sec";
+  std::cout << ", avg " << std::setprecision(2) << stats.avg_nodes_per_search()
+            << " nodes/search";
+  std::cout << ", max depth " << stats.max_depth << "] ";
+
+  // Just verify it runs without crashing and produces reasonable stats
+  ASSERT(stats.lookups == tb.size());
+  ASSERT(stats.max_depth < 100);  // Search shouldn't go too deep
+}
+
+TEST(compression_ratio_analysis) {
+  // Analyze compression ratios across multiple materials
+  std::vector<Material> materials = {
+    {0, 0, 0, 0, 1, 1},  // KvK
+    {0, 0, 0, 0, 2, 1},  // KKvK
+    {0, 0, 0, 1, 1, 0},  // KvP
+    {0, 0, 0, 2, 1, 0},  // KvPP
+  };
+
+  std::cout << "\n    [Compression analysis:";
+
+  for (const Material& m : materials) {
+    std::vector<Value> tb = load_tablebase(m);
+    if (tb.empty()) continue;
+
+    CompressionStats stats = analyze_compression(tb, m);
+    std::cout << " " << m << "=" << std::fixed << std::setprecision(0)
+              << (100.0 * stats.dont_care_ratio()) << "%DC";
+  }
+  std::cout << "] ";
+
+  ASSERT(true);  // Info-only test
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -470,6 +889,25 @@ int main() {
   RUN_TEST(indexing_roundtrip_kvpp);
   RUN_TEST(indexing_with_back_pawns);
   RUN_TEST(material_flip);
+
+  std::cout << "\nRunning compression tests (Stage 1):\n";
+  RUN_TEST(has_captures_pawn);
+  RUN_TEST(has_captures_none);
+  RUN_TEST(has_captures_queen);
+  RUN_TEST(is_dont_care_we_capture);
+  RUN_TEST(is_dont_care_opponent_captures);
+  RUN_TEST(is_dont_care_quiet_position);
+  RUN_TEST(compression_stats_kvk);
+  RUN_TEST(mark_dont_care_roundtrip);
+  RUN_TEST(lookup_search_correctness);
+
+  std::cout << "\nRunning compression tests (Stage 2):\n";
+  RUN_TEST(search_stats_tracking);
+  RUN_TEST(lookup_correctness_kvkk);
+  RUN_TEST(lookup_correctness_multi_material);
+  RUN_TEST(lookup_with_sub_tablebases);
+  RUN_TEST(search_performance_benchmark);
+  RUN_TEST(compression_ratio_analysis);
 
   std::cout << "\n========================================\n";
   std::cout << "Tests: " << tests_passed << "/" << tests_run << " passed\n";

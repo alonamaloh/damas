@@ -95,45 +95,7 @@ std::vector<DTM> generate_dtm(
     const std::unordered_map<Material, std::vector<Value>>& wdl_tablebases,
     const std::unordered_map<Material, std::vector<DTM>>& dtm_tablebases);
 
-// Check if a position has captures available (mandatory in Spanish checkers)
-bool has_captures(const Board& board) {
-  Bb empty = board.empty();
-
-  // Pawn captures
-  Bb pawnCanCaptureNW = moveSE(board.black & moveSE(empty));
-  Bb pawnCanCaptureNE = moveSW(board.black & moveSW(empty));
-  if (board.whitePawns() & (pawnCanCaptureNW | pawnCanCaptureNE)) {
-    return true;
-  }
-
-  // Queen captures
-  Bb kingOrEmpty = board.whiteQueens() | empty;
-  Bb canBeCapturedNW = board.black & moveSE(kingOrEmpty);
-  Bb canBeCapturedNE = board.black & moveSW(kingOrEmpty);
-  Bb canBeCapturedSE = board.black & moveNW(kingOrEmpty);
-  Bb canBeCapturedSW = board.black & moveNE(kingOrEmpty);
-
-  // Check if any queen can reach a capture position
-  Bb queenCanCapture = 0;
-  for (Bb x = moveSE(canBeCapturedNW) & kingOrEmpty; x; x = moveSE(x) & kingOrEmpty) {
-    queenCanCapture |= x;
-    x &= empty;
-  }
-  for (Bb x = moveSW(canBeCapturedNE) & kingOrEmpty; x; x = moveSW(x) & kingOrEmpty) {
-    queenCanCapture |= x;
-    x &= empty;
-  }
-  for (Bb x = moveNW(canBeCapturedSE) & kingOrEmpty; x; x = moveNW(x) & kingOrEmpty) {
-    queenCanCapture |= x;
-    x &= empty;
-  }
-  for (Bb x = moveNE(canBeCapturedSW) & kingOrEmpty; x; x = moveNE(x) & kingOrEmpty) {
-    queenCanCapture |= x;
-    x &= empty;
-  }
-
-  return (board.whiteQueens() & queenCanCapture) != 0;
-}
+// has_captures() is now in movegen.h
 
 // Get all materials reachable by captures from the current material
 std::vector<Material> capture_targets(const Material& m) {
