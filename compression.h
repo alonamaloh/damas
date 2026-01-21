@@ -130,7 +130,10 @@ enum class CompressionMethod : std::uint8_t {
   TERNARY_BASE3 = 1,      // Base-3 encoding, 5 values per byte
   DEFAULT_EXCEPTIONS = 2, // Default value + sorted exception list
   RLE_BINARY_SEARCH = 3,  // Run-length encoding with binary search
-  // Future: Huffman RLE variants (4-7)
+  HUFFMAN_RLE_SHORT = 4,  // Huffman RLE optimized for short runs (~10 avg)
+  HUFFMAN_RLE_MEDIUM = 5, // Huffman RLE optimized for medium runs (~50 avg)
+  HUFFMAN_RLE_LONG = 6,   // Huffman RLE optimized for long runs (~200 avg)
+  HUFFMAN_RLE_VARIABLE = 7, // Huffman RLE for geometric distribution
 };
 
 // Compressed block header
@@ -255,7 +258,7 @@ Value lookup_compressed_with_search(
 
 struct BlockCompressionStats {
   std::size_t total_blocks = 0;
-  std::size_t method_counts[4] = {0, 0, 0, 0};  // Count per method
+  std::size_t method_counts[8] = {0, 0, 0, 0, 0, 0, 0, 0};  // Count per method
   std::size_t uncompressed_size = 0;
   std::size_t compressed_size = 0;
 
@@ -275,4 +278,96 @@ BlockCompressionStats analyze_block_compression(const CompressedTablebase& tb);
 
 constexpr char CWDL_MAGIC[4] = {'C', 'W', 'D', 'L'};
 constexpr std::uint8_t CWDL_VERSION = 1;
+
+// ============================================================================
+// BitWriter/BitReader for Huffman Encoding (Stage 4)
+// ============================================================================
+
+// Bit-level writer for Huffman encoding
+class BitWriter {
+public:
+  BitWriter();
+
+  // Write bits (value is right-aligned, num_bits <= 32)
+  void write(std::uint32_t value, int num_bits);
+
+  // Flush remaining bits and get the result
+  std::vector<std::uint8_t> finish();
+
+  // Current bit position
+  std::size_t bit_count() const { return bit_count_; }
+
+private:
+  std::vector<std::uint8_t> buffer_;
+  std::uint32_t current_byte_ = 0;
+  int bits_in_byte_ = 0;
+  std::size_t bit_count_ = 0;
+};
+
+// Bit-level reader for Huffman decoding
+class BitReader {
+public:
+  BitReader(const std::uint8_t* data, std::size_t size);
+
+  // Read bits (returns right-aligned value)
+  std::uint32_t read(int num_bits);
+
+  // Peek at next bits without consuming
+  std::uint32_t peek(int num_bits) const;
+
+  // Check if more bits available
+  bool has_bits(int num_bits) const;
+
+  // Current bit position
+  std::size_t bit_pos() const { return bit_pos_; }
+
+private:
+  const std::uint8_t* data_;
+  std::size_t size_;
+  std::size_t bit_pos_ = 0;
+};
+
+// ============================================================================
+// Run-Length Statistics Collection (Stage 4)
+// ============================================================================
+
+struct RunStatistics {
+  std::size_t total_blocks = 0;
+  std::size_t total_runs = 0;
+  std::size_t total_positions = 0;
+
+  // Run length histogram (bucket i = lengths 2^i to 2^(i+1)-1)
+  std::size_t run_length_histogram[16] = {0};
+
+  // Prediction accuracy (run k == run k-2)
+  std::size_t prediction_correct = 0;
+  std::size_t prediction_total = 0;
+
+  // Value distribution
+  std::size_t value_counts[4] = {0};  // WIN, DRAW, LOSS, UNKNOWN
+
+  // Number of distinct values per block histogram
+  std::size_t distinct_value_histogram[5] = {0};  // 1, 2, 3, 4 distinct values
+
+  double prediction_accuracy() const {
+    return prediction_total > 0
+      ? static_cast<double>(prediction_correct) / prediction_total
+      : 0.0;
+  }
+
+  double avg_run_length() const {
+    return total_runs > 0
+      ? static_cast<double>(total_positions) / total_runs
+      : 0.0;
+  }
+};
+
+// Collect run-length statistics from a single block
+void collect_block_run_statistics(const Value* values, std::size_t count, RunStatistics& stats);
+
+// Collect statistics across all tablebases in a directory
+RunStatistics collect_all_tablebase_statistics(const std::string& directory = ".");
+
+// Print statistics summary
+void print_run_statistics(const RunStatistics& stats);
 

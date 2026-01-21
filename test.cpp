@@ -1032,12 +1032,15 @@ TEST(compressed_lookup_with_cache) {
     ASSERT(looked_up == original[i]);
   }
 
-  // For random-access methods (RAW_2BIT, TERNARY_BASE3), the cache is not used
-  // because we can decode individual values without decompressing the whole block.
-  // This is by design - cache is only for sequential-access methods (Huffman, etc.).
-  // So we check that the cache was not used (0 hits + 0 misses = 0 total).
-  ASSERT(cache.hits() == 0);
-  ASSERT(cache.misses() == 0);
+  // If Huffman methods are selected, the cache will be used.
+  // If random-access methods are selected, the cache won't be used.
+  // Either way, the lookups should be correct (verified above).
+  // If cache was used, we should have a good hit rate for sequential access.
+  if (cache.misses() > 0) {
+    // Cache was used (Huffman method selected)
+    // For sequential access of all positions, hit rate should be high
+    ASSERT(cache.hit_rate() > 0.9);
+  }
 }
 
 TEST(block_compression_stats) {
@@ -1202,6 +1205,106 @@ TEST(rle_best_selection) {
 }
 
 // =============================================================================
+// Huffman RLE compression tests (Stage 4)
+// =============================================================================
+
+TEST(huffman_short_roundtrip) {
+  // Test HUFFMAN_RLE_SHORT round-trip
+  std::vector<Value> values;
+  for (int i = 0; i < 100; ++i) values.push_back(Value::WIN);
+  for (int i = 0; i < 50; ++i) values.push_back(Value::LOSS);
+  for (int i = 0; i < 100; ++i) values.push_back(Value::DRAW);
+  for (int i = 0; i < 50; ++i) values.push_back(Value::WIN);
+
+  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::HUFFMAN_RLE_SHORT);
+  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::HUFFMAN_RLE_SHORT);
+
+  ASSERT_EQ(decompressed.size(), values.size());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    ASSERT(decompressed[i] == values[i]);
+  }
+}
+
+TEST(huffman_variable_roundtrip) {
+  // Test HUFFMAN_RLE_VARIABLE round-trip
+  std::vector<Value> values;
+  for (int i = 0; i < 100; ++i) values.push_back(Value::WIN);
+  for (int i = 0; i < 50; ++i) values.push_back(Value::LOSS);
+  for (int i = 0; i < 100; ++i) values.push_back(Value::DRAW);
+
+  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::HUFFMAN_RLE_VARIABLE);
+  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::HUFFMAN_RLE_VARIABLE);
+
+  ASSERT_EQ(decompressed.size(), values.size());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    ASSERT(decompressed[i] == values[i]);
+  }
+}
+
+TEST(huffman_two_values_roundtrip) {
+  // Test with only 2 distinct values (no prediction bit needed)
+  std::vector<Value> values;
+  for (int i = 0; i < 200; ++i) values.push_back(Value::WIN);
+  for (int i = 0; i < 100; ++i) values.push_back(Value::LOSS);
+  for (int i = 0; i < 200; ++i) values.push_back(Value::WIN);
+
+  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::HUFFMAN_RLE_SHORT);
+  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::HUFFMAN_RLE_SHORT);
+
+  ASSERT_EQ(decompressed.size(), values.size());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    ASSERT(decompressed[i] == values[i]);
+  }
+}
+
+TEST(huffman_single_value_block) {
+  // Test with all same value (single run)
+  std::vector<Value> values(1000, Value::DRAW);
+
+  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::HUFFMAN_RLE_SHORT);
+  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::HUFFMAN_RLE_SHORT);
+
+  ASSERT_EQ(decompressed.size(), values.size());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    ASSERT(decompressed[i] == Value::DRAW);
+  }
+
+  // Single-value block should be very small (2 bytes)
+  ASSERT_EQ(compressed.size(), 2u);
+}
+
+TEST(huffman_alternating) {
+  // Test with alternating values (many short runs)
+  std::vector<Value> values;
+  for (int i = 0; i < 50; ++i) {
+    values.push_back(i % 2 == 0 ? Value::WIN : Value::LOSS);
+  }
+
+  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::HUFFMAN_RLE_SHORT);
+  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::HUFFMAN_RLE_SHORT);
+
+  ASSERT_EQ(decompressed.size(), values.size());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    ASSERT(decompressed[i] == values[i]);
+  }
+}
+
+TEST(huffman_best_vs_rle) {
+  // Test that compress_block_best chooses between Huffman and RLE appropriately
+  // With few long runs, RLE should still win (simpler)
+  std::vector<Value> values;
+  for (int i = 0; i < 8000; ++i) values.push_back(Value::WIN);
+  for (int i = 0; i < 8000; ++i) values.push_back(Value::LOSS);
+
+  auto [method, data] = compress_block_best(values.data(), values.size());
+
+  // RLE: 2 records = 4 bytes should win
+  // Huffman: header (5 bytes) + encoded runs > 4 bytes
+  ASSERT(method == CompressionMethod::RLE_BINARY_SEARCH);
+  ASSERT_EQ(data.size(), 4u);
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -1285,6 +1388,14 @@ int main() {
   RUN_TEST(rle_alternating);
   RUN_TEST(rle_binary_search_lookup);
   RUN_TEST(rle_best_selection);
+
+  std::cout << "\nRunning Huffman RLE compression tests (Stage 4):\n";
+  RUN_TEST(huffman_short_roundtrip);
+  RUN_TEST(huffman_variable_roundtrip);
+  RUN_TEST(huffman_two_values_roundtrip);
+  RUN_TEST(huffman_single_value_block);
+  RUN_TEST(huffman_alternating);
+  RUN_TEST(huffman_best_vs_rle);
 
   std::cout << "\n========================================\n";
   std::cout << "Tests: " << tests_passed << "/" << tests_run << " passed\n";
