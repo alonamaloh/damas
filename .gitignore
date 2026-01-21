@@ -1,0 +1,13 @@
+# Build artifacts
+*.o
+damas
+test
+generate
+lookup
+verify
+
+# Tablebase data files
+*.bin
+
+# Claude Code
+.claude/
