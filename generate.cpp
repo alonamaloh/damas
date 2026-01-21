@@ -10,6 +10,10 @@
 #include <cstring>
 #include <mutex>
 #include <algorithm>
+#include <map>
+#include <tuple>
+#include <thread>
+#include <condition_variable>
 #include <omp.h>
 
 namespace {
@@ -204,6 +208,11 @@ std::vector<Value> generate_tablebase(
   // A position is LOSS if ALL successors are WIN for opponent
   std::vector<std::uint16_t> unknown_successor_count(size, 0);
 
+  // Track positions with external draw escapes (material-changing moves to DRAW)
+  // If a position has an external draw escape, it can't be LOSS even if all
+  // internal successors are WIN for opponent
+  std::vector<bool> has_external_draw(size, false);
+
   // Predecessor lists for backward propagation
   // predecessors[i] = list of (predecessor_index) that lead to position i
   std::vector<std::vector<std::size_t>> predecessors(size);
@@ -244,11 +253,21 @@ std::vector<Value> generate_tablebase(
       bool material_changed = !(next_m == flip(m));
 
       if (material_changed) {
-        // Lookup in sub-tablebase (from opponent's perspective)
-        // After flip in makeMove, 'next' has opponent as "white" (to move)
-        // We lookup from their perspective
-        auto it = sub_tablebases.find(next_m);
-        if (it != sub_tablebases.end() && !it->second.empty()) {
+        // Check for terminal positions first (one side eliminated)
+        if (next_m.white_pieces() == 0) {
+          // After flip, opponent (original us) has 0 pieces = we captured everything
+          // Opponent loses immediately = we win!
+          found_win = true;
+        } else if (next_m.black_pieces() == 0) {
+          // After flip, we (original opponent) have 0 pieces = shouldn't happen
+          // This would mean we captured our own pieces, which is impossible
+          bad_successors++;
+        } else {
+          // Lookup in sub-tablebase (from opponent's perspective)
+          // After flip in makeMove, 'next' has opponent as "white" (to move)
+          // We lookup from their perspective
+          auto it = sub_tablebases.find(next_m);
+          if (it != sub_tablebases.end() && !it->second.empty()) {
           // Verify material matches before indexing
           Material verify_m = get_material(next);
           if (verify_m == next_m) {
@@ -264,11 +283,15 @@ std::vector<Value> generate_tablebase(
                 } else if (sub_val == Value::WIN) {
                   // Opponent wins -> this successor is bad for us
                   bad_successors++;
+                } else if (sub_val == Value::DRAW) {
+                  // External draw escape - can't be LOSS even if all internal moves are bad
+                  has_external_draw[idx] = true;
                 }
-                // DRAW or UNKNOWN doesn't resolve the position yet
+                // UNKNOWN doesn't resolve the position yet
               }
             }
           }
+        }
         }
       } else {
         // Quiet move - material stays same after flip
@@ -293,6 +316,9 @@ std::vector<Value> generate_tablebase(
                 found_win = true;
               } else if (sub_val == Value::WIN) {
                 bad_successors++;
+              } else if (sub_val == Value::DRAW) {
+                // External draw escape
+                has_external_draw[idx] = true;
               }
             }
           }
@@ -351,10 +377,18 @@ std::vector<Value> generate_tablebase(
         // Successor is WIN for opponent -> one fewer good option for us
         unknown_successor_count[pred_idx]--;
         if (unknown_successor_count[pred_idx] == 0) {
-          // All successors are wins for opponent -> we LOSE
-          table[pred_idx] = Value::LOSS;
-          stats.losses++;
-          work_queue.push(pred_idx);
+          // All internal successors are wins for opponent
+          if (has_external_draw[pred_idx]) {
+            // But we have an external draw escape -> DRAW
+            table[pred_idx] = Value::DRAW;
+            stats.draws++;
+            // Don't push to work queue - DRAW doesn't propagate
+          } else {
+            // No escape -> we LOSE
+            table[pred_idx] = Value::LOSS;
+            stats.losses++;
+            work_queue.push(pred_idx);
+          }
         }
       }
     }
@@ -371,9 +405,58 @@ std::vector<Value> generate_tablebase(
   return table;
 }
 
-// Get all sub-materials that need to be solved before this one
+// Get direct dependencies for scheduling (not transitive closure)
+// Only includes materials reachable by a single capture, advancement, or promotion
 // Excludes flip(m) since that's handled specially by solve_pair
 std::vector<Material> get_dependencies(const Material& m) {
+  std::unordered_set<Material> deps;
+  Material flipped_m = flip(m);
+
+  // Helper to add a dependency (and its flip) if valid
+  auto add_dep = [&](const Material& target) {
+    if (!(target == m) && !(target == flipped_m)) {
+      deps.insert(target);
+      Material ft = flip(target);
+      if (!(ft == m) && !(ft == flipped_m)) {
+        deps.insert(ft);
+      }
+    }
+  };
+
+  // Process both m and flip(m) to get all direct transitions
+  for (const Material& curr : {m, flipped_m}) {
+    // Capture targets (removes one opponent piece)
+    for (const Material& target : capture_targets(curr)) {
+      add_dep(target);
+    }
+
+    // Advancement targets (back pawn -> normal pawn)
+    for (const Material& target : advancement_targets(curr)) {
+      add_dep(target);
+    }
+
+    // Promotion targets (normal pawn -> queen)
+    for (const Material& target : promotion_targets(curr)) {
+      add_dep(target);
+    }
+
+    // Also consider opponent's advancement and promotion (after board flip)
+    Material curr_flipped = flip(curr);
+    for (const Material& target : advancement_targets(curr_flipped)) {
+      add_dep(flip(target));
+    }
+    for (const Material& target : promotion_targets(curr_flipped)) {
+      add_dep(flip(target));
+    }
+  }
+
+  return std::vector<Material>(deps.begin(), deps.end());
+}
+
+// Get ALL sub-materials needed for generating tablebase (transitive closure)
+// A single move can combine captures with advancement/promotion, so we need the
+// full transitive closure of all material-changing operations
+std::vector<Material> get_sub_materials(const Material& m) {
   std::unordered_set<Material> deps;
   Material flipped_m = flip(m);
   std::vector<Material> to_process = {m, flipped_m};
@@ -382,52 +465,39 @@ std::vector<Material> get_dependencies(const Material& m) {
     Material curr = to_process.back();
     to_process.pop_back();
 
-    // Add capture targets (from opponent's perspective after flip)
-    for (const Material& target : capture_targets(curr)) {
-      // Exclude m and flip(m) from dependencies (handled as a pair)
+    // Helper to add a dependency and queue for processing
+    auto add_and_queue = [&](const Material& target) {
       if (deps.find(target) == deps.end() && !(target == m) && !(target == flipped_m)) {
         deps.insert(target);
         to_process.push_back(target);
       }
-      // Also consider flipped version
       Material flipped = flip(target);
       if (deps.find(flipped) == deps.end() && !(flipped == m) && !(flipped == flipped_m)) {
         deps.insert(flipped);
         to_process.push_back(flipped);
       }
+    };
+
+    // Capture targets (transitive - follow all capture chains)
+    for (const Material& target : capture_targets(curr)) {
+      add_and_queue(target);
     }
 
-    // Add advancement targets (for both sides)
+    // Advancement targets (transitive - can chain with captures)
     for (const Material& target : advancement_targets(curr)) {
-      if (deps.find(target) == deps.end() && !(target == m) && !(target == flipped_m)) {
-        deps.insert(target);
-        to_process.push_back(target);
-      }
+      add_and_queue(target);
     }
-    // Also black pawn advancement (from opponent's perspective)
     Material curr_flipped = flip(curr);
     for (const Material& target : advancement_targets(curr_flipped)) {
-      Material target_reflipped = flip(target);
-      if (deps.find(target_reflipped) == deps.end() && !(target_reflipped == m) && !(target_reflipped == flipped_m)) {
-        deps.insert(target_reflipped);
-        to_process.push_back(target_reflipped);
-      }
+      add_and_queue(flip(target));
     }
 
-    // Add promotion targets
+    // Promotion targets (transitive - can chain with captures)
     for (const Material& target : promotion_targets(curr)) {
-      if (deps.find(target) == deps.end() && !(target == m) && !(target == flipped_m)) {
-        deps.insert(target);
-        to_process.push_back(target);
-      }
+      add_and_queue(target);
     }
-    // Also opponent promotion
     for (const Material& target : promotion_targets(curr_flipped)) {
-      Material target_reflipped = flip(target);
-      if (deps.find(target_reflipped) == deps.end() && !(target_reflipped == m) && !(target_reflipped == flipped_m)) {
-        deps.insert(target_reflipped);
-        to_process.push_back(target_reflipped);
-      }
+      add_and_queue(flip(target));
     }
   }
 
@@ -546,8 +616,8 @@ bool contains(const std::vector<Material>& vec, const Material& m) {
 // Thread-safe solve for a single symmetric material
 // Uses global g_wdl_tablebases and builds local copies of dependencies
 void solve_single_threadsafe(const Material& m) {
-  // Build local sub_tablebases from dependencies (read-only after previous level)
-  std::vector<Material> deps = get_dependencies(m);
+  // Build local sub_tablebases from all reachable materials (for multi-captures)
+  std::vector<Material> deps = get_sub_materials(m);
   std::unordered_map<Material, std::vector<Value>> local_tablebases = build_local_wdl_tablebases(deps);
 
   // Also load from disk if not in memory
@@ -583,8 +653,8 @@ void solve_single_threadsafe(const Material& m) {
 
 // Thread-safe solve for a pair of mutually-dependent materials
 void solve_pair_threadsafe(const Material& m1, const Material& m2) {
-  // Build local sub_tablebases from dependencies
-  std::vector<Material> deps = get_dependencies(m1);  // Same as m2's deps
+  // Build local sub_tablebases from all reachable materials (for multi-captures)
+  std::vector<Material> deps = get_sub_materials(m1);  // Same as m2's deps
   std::unordered_map<Material, std::vector<Value>> local_tablebases = build_local_wdl_tablebases(deps);
 
   // Also load from disk if not in memory
@@ -668,81 +738,169 @@ void solve_pair_threadsafe(const Material& m1, const Material& m2) {
   store_wdl_tablebase(m2, std::move(table2));
 }
 
-// Solve all materials up to max_pieces in parallel
-// Materials are grouped by piece count (level) and solved level by level
+// Solve all materials up to max_pieces in parallel using dependency graph
+// A material can start processing as soon as all its actual dependencies are done,
+// not when all materials at a "lower level" are done.
 void solve_all_parallel(int max_pieces) {
-  // Step 1: Generate all materials and group by piece count
-  std::vector<std::vector<Material>> levels(max_pieces + 1);
   std::vector<Material> all = all_materials(max_pieces);
-
-  for (const Material& m : all) {
-    levels[m.total_pieces()].push_back(m);
-  }
 
   std::cout << "=== Parallel Tablebase Generation ===" << std::endl;
   std::cout << "Using " << omp_get_max_threads() << " threads" << std::endl;
-  for (int level = 2; level <= max_pieces; ++level) {
-    std::cout << "Level " << level << ": " << levels[level].size() << " materials" << std::endl;
+  std::cout << "Total materials: " << all.size() << std::endl;
+
+  // Canonicalize materials: for asymmetric pairs, pick one representative
+  // Map each material to its canonical form
+  std::unordered_map<Material, Material> canonical;
+  std::unordered_set<Material> canonical_set;
+
+  // Helper to pick canonical representative (lexicographic on fields)
+  auto material_less = [](const Material& a, const Material& b) {
+    if (a.back_white_pawns != b.back_white_pawns) return a.back_white_pawns < b.back_white_pawns;
+    if (a.back_black_pawns != b.back_black_pawns) return a.back_black_pawns < b.back_black_pawns;
+    if (a.other_white_pawns != b.other_white_pawns) return a.other_white_pawns < b.other_white_pawns;
+    if (a.other_black_pawns != b.other_black_pawns) return a.other_black_pawns < b.other_black_pawns;
+    if (a.white_queens != b.white_queens) return a.white_queens < b.white_queens;
+    return a.black_queens < b.black_queens;
+  };
+
+  for (const Material& m : all) {
+    Material f = flip(m);
+    if (canonical.find(m) == canonical.end()) {
+      // Use smaller material as canonical (arbitrary but consistent)
+      Material c = material_less(m, f) ? m : f;
+      canonical[m] = c;
+      canonical[f] = c;
+      canonical_set.insert(c);
+    }
   }
-  std::cout << std::endl;
 
-  // Step 2: Process levels sequentially (dependencies only come from lower levels)
-  for (int level = 2; level <= max_pieces; ++level) {
-    auto level_start = std::chrono::high_resolution_clock::now();
-    std::cout << "=== Processing Level " << level << " (" << levels[level].size() << " materials) ===" << std::endl;
+  std::vector<Material> work_units(canonical_set.begin(), canonical_set.end());
+  std::cout << "Work units (canonical materials): " << work_units.size() << std::endl << std::endl;
 
-    // Separate symmetric vs asymmetric materials
-    std::vector<Material> symmetric;
-    std::vector<Material> asymmetric_canonical;  // One representative per pair
-    std::unordered_set<Material> seen;
+  // Build dependency graph: for each work unit, which work units must complete first?
+  std::unordered_map<Material, std::vector<Material>> dependents;  // m -> list of materials that depend on m
+  std::unordered_map<Material, int> dep_count;  // m -> number of unresolved dependencies
 
-    for (const Material& m : levels[level]) {
-      // Skip terminal materials (handled below)
-      if (m.white_pieces() == 0 || m.black_pieces() == 0) {
-        // Register terminal material
-        std::size_t size = material_size(m);
-        if (size > 0) {
-          Value terminal_val = (m.white_pieces() == 0) ? Value::LOSS : Value::WIN;
-          std::vector<Value> table(size, terminal_val);
-          store_wdl_tablebase(m, std::move(table));
+  for (const Material& m : work_units) {
+    dep_count[m] = 0;
+  }
+
+  for (const Material& m : work_units) {
+    // Get dependencies for both m and flip(m)
+    std::vector<Material> deps = get_dependencies(m);
+    std::unordered_set<Material> canonical_deps;
+
+    for (const Material& dep : deps) {
+      Material c = canonical[dep];
+      if (c != m && canonical_set.find(c) != canonical_set.end()) {
+        canonical_deps.insert(c);
+      }
+    }
+
+    dep_count[m] = canonical_deps.size();
+    for (const Material& dep : canonical_deps) {
+      dependents[dep].push_back(m);
+    }
+  }
+
+  // Initialize terminal materials and work queue
+  std::queue<Material> ready_queue;
+  std::mutex queue_mutex;
+  std::condition_variable queue_cv;
+  int remaining = work_units.size();
+  bool done = false;
+
+  for (const Material& m : work_units) {
+    // Handle terminal materials immediately
+    if (m.white_pieces() == 0 || m.black_pieces() == 0) {
+      std::size_t size = material_size(m);
+      if (size > 0) {
+        Value terminal_val = (m.white_pieces() == 0) ? Value::LOSS : Value::WIN;
+        std::vector<Value> table(size, terminal_val);
+        store_wdl_tablebase(m, std::move(table));
+      }
+      // Also store flipped version
+      Material f = flip(m);
+      if (!(f == m)) {
+        std::size_t fsize = material_size(f);
+        if (fsize > 0) {
+          Value terminal_val = (f.white_pieces() == 0) ? Value::LOSS : Value::WIN;
+          std::vector<Value> table(fsize, terminal_val);
+          store_wdl_tablebase(f, std::move(table));
         }
-        continue;
+      }
+      // Mark complete and update dependents
+      {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        remaining--;
+        for (const Material& dep_m : dependents[m]) {
+          dep_count[dep_m]--;
+          if (dep_count[dep_m] == 0) {
+            ready_queue.push(dep_m);
+          }
+        }
+      }
+    } else if (dep_count[m] == 0) {
+      ready_queue.push(m);
+    }
+  }
+
+  auto total_start = std::chrono::high_resolution_clock::now();
+
+  // Worker function
+  auto worker = [&]() {
+    while (true) {
+      Material m;
+      {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        queue_cv.wait(lock, [&]() { return !ready_queue.empty() || done; });
+        if (done && ready_queue.empty()) return;
+        if (ready_queue.empty()) continue;
+        m = ready_queue.front();
+        ready_queue.pop();
       }
 
+      // Process this material
       Material f = flip(m);
       if (m == f) {
-        // Self-symmetric
-        symmetric.push_back(m);
-      } else if (seen.find(m) == seen.end() && seen.find(f) == seen.end()) {
-        // First time seeing this pair
-        asymmetric_canonical.push_back(m);
-        seen.insert(m);
-        seen.insert(f);
+        solve_single_threadsafe(m);
+      } else {
+        solve_pair_threadsafe(m, f);
+      }
+
+      // Update dependents
+      {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        remaining--;
+        for (const Material& dep_m : dependents[m]) {
+          dep_count[dep_m]--;
+          if (dep_count[dep_m] == 0) {
+            ready_queue.push(dep_m);
+          }
+        }
+        if (remaining == 0) {
+          done = true;
+        }
+        queue_cv.notify_all();
       }
     }
+  };
 
-    std::cout << "  Symmetric: " << symmetric.size() << ", Asymmetric pairs: " << asymmetric_canonical.size() << std::endl;
-
-    // Process symmetric materials in parallel
-    if (!symmetric.empty()) {
-      #pragma omp parallel for schedule(dynamic)
-      for (std::size_t i = 0; i < symmetric.size(); ++i) {
-        solve_single_threadsafe(symmetric[i]);
-      }
-    }
-
-    // Process asymmetric pairs in parallel
-    if (!asymmetric_canonical.empty()) {
-      #pragma omp parallel for schedule(dynamic)
-      for (std::size_t i = 0; i < asymmetric_canonical.size(); ++i) {
-        solve_pair_threadsafe(asymmetric_canonical[i], flip(asymmetric_canonical[i]));
-      }
-    }
-
-    auto level_end = std::chrono::high_resolution_clock::now();
-    auto level_duration = std::chrono::duration_cast<std::chrono::seconds>(level_end - level_start);
-    std::cout << "Level " << level << " completed in " << level_duration.count() << "s" << std::endl << std::endl;
+  // Launch worker threads
+  int num_threads = omp_get_max_threads();
+  std::vector<std::thread> threads;
+  for (int i = 0; i < num_threads; ++i) {
+    threads.emplace_back(worker);
   }
+
+  // Wait for all to complete
+  for (auto& t : threads) {
+    t.join();
+  }
+
+  auto total_end = std::chrono::high_resolution_clock::now();
+  auto total_duration = std::chrono::duration_cast<std::chrono::seconds>(total_end - total_start);
+  std::cout << "\nTotal generation time: " << total_duration.count() << "s" << std::endl;
 }
 
 // Recursive solver with memoization

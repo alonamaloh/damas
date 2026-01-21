@@ -1,16 +1,33 @@
 #include "tablebase.h"
 #include "board.h"
+#include "movegen.h"
 #include <iostream>
+#include <unordered_map>
+
+// Cache for looking up successors
+std::unordered_map<Material, std::vector<Value>> wdl_cache;
+
+Value lookup_wdl(const Board& b) {
+  Material m = get_material(b);
+  if (wdl_cache.find(m) == wdl_cache.end()) {
+    wdl_cache[m] = load_tablebase(m);
+  }
+  auto& tb = wdl_cache[m];
+  if (tb.empty()) return Value::UNKNOWN;
+  std::size_t idx = board_to_index(b, m);
+  if (idx >= tb.size()) return Value::UNKNOWN;
+  return tb[idx];
+}
 
 int main() {
-  // White queens on 1, 3 (0-indexed: 0, 2)
-  // White pawn on 2 (0-indexed: 1)
-  // Black pawn on 9 (0-indexed: 8)
-  // Black queen on 31 (0-indexed: 30)
+  // Investigate error at index 17506 of material 001111
+  // White: 0x1000008, Black: 0x2100000, Kings: 0x100008
+  // Expected: LOSS, Got: DRAW
+
   Board b;
-  b.white = (1u << 0) | (1u << 1) | (1u << 2);  // squares 0, 1, 2
-  b.black = (1u << 8) | (1u << 30);  // squares 8, 30
-  b.kings = (1u << 0) | (1u << 2) | (1u << 30);  // queens only
+  b.white = 0x1000008;
+  b.black = 0x2100000;
+  b.kings = 0x100008;
   b.n_reversible = 0;
 
   std::cout << "Board:\n" << b << std::endl;
@@ -26,40 +43,64 @@ int main() {
   std::vector<Value> wdl = load_tablebase(m);
   if (wdl.empty()) {
     std::cout << "WDL tablebase not found" << std::endl;
-  } else {
-    std::cout << "WDL value: ";
-    switch (wdl[idx]) {
-      case Value::WIN: std::cout << "WIN"; break;
-      case Value::LOSS: std::cout << "LOSS"; break;
-      case Value::DRAW: std::cout << "DRAW"; break;
-      default: std::cout << "UNKNOWN"; break;
+    return 1;
+  }
+  std::cout << "WDL value: ";
+  switch (wdl[idx]) {
+    case Value::WIN: std::cout << "WIN"; break;
+    case Value::LOSS: std::cout << "LOSS"; break;
+    case Value::DRAW: std::cout << "DRAW"; break;
+    default: std::cout << "UNKNOWN"; break;
+  }
+  std::cout << std::endl;
+
+  // Generate moves
+  std::vector<Move> moves;
+  generateMoves(b, moves);
+  std::cout << "\nMoves available: " << moves.size() << std::endl;
+
+  // Analyze all successors
+  std::cout << "\n=== All successor positions ===" << std::endl;
+  Material flipped_m = flip(m);
+  std::cout << "Flipped material (for quiet moves): " << flipped_m << std::endl;
+
+  bool found_loss = false;  // If we find opponent LOSS, we should be WIN
+  bool all_wins = true;     // If all successors are opponent WIN, we should be LOSS
+
+  for (size_t i = 0; i < moves.size(); i++) {
+    Board next = makeMove(b, moves[i]);
+    Material next_m = get_material(next);
+    Value succ_val = lookup_wdl(next);
+
+    // Check for terminal capture
+    bool terminal = (next_m.white_pieces() == 0);
+    if (terminal) {
+      std::cout << "Move " << i << ": TERMINAL CAPTURE (WIN for us)" << std::endl;
+      found_loss = true;  // terminal capture = opponent loses
+      all_wins = false;
+      continue;
+    }
+
+    std::cout << "Move " << i << " -> material " << next_m << ": ";
+    switch (succ_val) {
+      case Value::WIN: std::cout << "opponent WIN (bad)"; break;
+      case Value::LOSS: std::cout << "opponent LOSS (good!)"; found_loss = true; all_wins = false; break;
+      case Value::DRAW: std::cout << "opponent DRAW"; all_wins = false; break;
+      default: std::cout << "UNKNOWN"; all_wins = false; break;
     }
     std::cout << std::endl;
   }
 
-  // Load DTM
-  std::vector<DTM> dtm_table = load_dtm(m);
-  if (dtm_table.empty()) {
-    std::cout << "DTM tablebase not found" << std::endl;
+  std::cout << "\n=== Analysis ===" << std::endl;
+  std::cout << "Found LOSS for opponent: " << (found_loss ? "YES" : "NO") << std::endl;
+  std::cout << "All successors WIN for opponent: " << (all_wins ? "YES" : "NO") << std::endl;
+
+  if (found_loss) {
+    std::cout << "Position should be WIN (has move to opponent LOSS)" << std::endl;
+  } else if (all_wins) {
+    std::cout << "Position should be LOSS (all moves lead to opponent WIN)" << std::endl;
   } else {
-    DTM d = dtm_table[idx];
-    std::cout << "DTM: ";
-    if (d == DTM_UNKNOWN) {
-      std::cout << "UNKNOWN";
-    } else if (d == DTM_DRAW) {
-      std::cout << "DRAW (0)";
-    } else if (d > 0) {
-      int moves = dtm_to_moves(d);
-      int plies = dtm_to_plies(d);
-      std::cout << "WIN, mate in " << moves << " (" << plies << " plies, DTM=" << d << ")";
-    } else if (d == DTM_LOSS_TERMINAL) {
-      std::cout << "LOSS, terminal (DTM=" << d << ")";
-    } else {
-      int moves = dtm_to_moves(d);
-      int plies = dtm_to_plies(d);
-      std::cout << "LOSS, lost in " << moves << " (" << plies << " plies, DTM=" << d << ")";
-    }
-    std::cout << std::endl;
+    std::cout << "Position should be DRAW (no WIN move, not all LOSS)" << std::endl;
   }
 
   return 0;
