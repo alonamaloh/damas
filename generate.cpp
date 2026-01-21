@@ -1354,10 +1354,11 @@ std::vector<Material> all_materials(int max_pieces) {
 
   for (int total = 2; total <= max_pieces; ++total) {
     // Enumerate all ways to distribute pieces
-    for (int bwp = 0; bwp <= std::min(4, total - 1); ++bwp) {
-      for (int bbp = 0; bbp <= std::min(4, total - bwp - 1); ++bbp) {
-        for (int owp = 0; owp <= std::min(24, total - bwp - bbp - 1); ++owp) {
-          for (int obp = 0; obp <= std::min(24 - owp, total - bwp - bbp - owp - 1); ++obp) {
+    // Note: bounds allow zero queens (all pieces can be pawns)
+    for (int bwp = 0; bwp <= std::min(4, total); ++bwp) {
+      for (int bbp = 0; bbp <= std::min(4, total - bwp); ++bbp) {
+        for (int owp = 0; owp <= std::min(24, total - bwp - bbp); ++owp) {
+          for (int obp = 0; obp <= std::min(24 - owp, total - bwp - bbp - owp); ++obp) {
             int remaining = total - bwp - bbp - owp - obp;
             for (int wq = 0; wq <= remaining; ++wq) {
               int bq = remaining - wq;
