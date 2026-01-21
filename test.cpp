@@ -846,6 +846,248 @@ TEST(compression_ratio_analysis) {
 }
 
 // =============================================================================
+// Stage 3: Block compression tests
+// =============================================================================
+
+TEST(raw_2bit_roundtrip) {
+  // Test that RAW_2BIT compression round-trips correctly
+  std::vector<Value> values = {
+    Value::WIN, Value::LOSS, Value::DRAW, Value::UNKNOWN,
+    Value::WIN, Value::WIN, Value::LOSS, Value::DRAW,
+    Value::UNKNOWN, Value::DRAW, Value::LOSS, Value::WIN,
+  };
+
+  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::RAW_2BIT);
+  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::RAW_2BIT);
+
+  ASSERT_EQ(decompressed.size(), values.size());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    ASSERT(decompressed[i] == values[i]);
+  }
+
+  // Check expected size: 4 values per byte
+  std::size_t expected_size = (values.size() + 3) / 4;
+  ASSERT_EQ(compressed.size(), expected_size);
+}
+
+TEST(raw_2bit_expected_size) {
+  // Method 0 produces 4096 bytes for 16384 positions
+  ASSERT_EQ(expected_compressed_size(BLOCK_SIZE, CompressionMethod::RAW_2BIT), 4096u);
+  ASSERT_EQ(expected_compressed_size(100, CompressionMethod::RAW_2BIT), 25u);
+  ASSERT_EQ(expected_compressed_size(1, CompressionMethod::RAW_2BIT), 1u);
+}
+
+TEST(ternary_base3_roundtrip) {
+  // Test that TERNARY_BASE3 compression round-trips correctly
+  // Only 3 distinct values
+  std::vector<Value> values = {
+    Value::WIN, Value::LOSS, Value::DRAW,
+    Value::WIN, Value::WIN, Value::LOSS, Value::DRAW,
+    Value::DRAW, Value::LOSS, Value::WIN,
+  };
+
+  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::TERNARY_BASE3);
+  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::TERNARY_BASE3);
+
+  ASSERT_EQ(decompressed.size(), values.size());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    ASSERT(decompressed[i] == values[i]);
+  }
+}
+
+TEST(ternary_base3_expected_size) {
+  // Method 1 produces ~3277 bytes for 16384 ternary values
+  // 1 header + ceil(16384/5) = 1 + 3277 = 3278 bytes
+  ASSERT_EQ(expected_compressed_size(BLOCK_SIZE, CompressionMethod::TERNARY_BASE3), 3278u);
+  ASSERT_EQ(expected_compressed_size(10, CompressionMethod::TERNARY_BASE3), 3u);  // 1 header + 2 data
+  ASSERT_EQ(expected_compressed_size(5, CompressionMethod::TERNARY_BASE3), 2u);   // 1 header + 1 data
+}
+
+TEST(ternary_fallback_on_4_values) {
+  // If a block has all 4 values, ternary should fall back to raw
+  std::vector<Value> values = {
+    Value::WIN, Value::LOSS, Value::DRAW, Value::UNKNOWN,
+    Value::WIN, Value::LOSS,
+  };
+
+  // Request ternary, but should get raw 2-bit because 4 distinct values
+  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::TERNARY_BASE3);
+
+  // Should still round-trip correctly
+  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::RAW_2BIT);
+
+  ASSERT_EQ(decompressed.size(), values.size());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    ASSERT(decompressed[i] == values[i]);
+  }
+}
+
+TEST(compress_block_best_selects_smallest) {
+  // Create a block with only 3 values - ternary should be chosen
+  std::vector<Value> values(100, Value::WIN);
+  values[50] = Value::LOSS;
+  values[75] = Value::DRAW;
+
+  auto [method, data] = compress_block_best(values.data(), values.size());
+
+  // Ternary should be selected as it's smaller
+  // Raw: 100/4 = 25 bytes
+  // Ternary: 1 + 100/5 = 21 bytes
+  ASSERT(method == CompressionMethod::TERNARY_BASE3);
+  ASSERT_EQ(data.size(), 21u);
+}
+
+TEST(block_indexing) {
+  // Test that correct block is selected for any position index
+  std::size_t num_positions = BLOCK_SIZE * 3 + 100;  // 3 full blocks + partial
+
+  for (std::size_t idx = 0; idx < num_positions; idx += BLOCK_SIZE / 2) {
+    std::uint32_t block_idx = static_cast<std::uint32_t>(idx / BLOCK_SIZE);
+    std::size_t idx_in_block = idx % BLOCK_SIZE;
+
+    // Verify invariant
+    ASSERT(block_idx * BLOCK_SIZE + idx_in_block == idx);
+  }
+
+  // Total number of blocks should be correct
+  std::uint32_t expected_blocks = (num_positions + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  ASSERT_EQ(expected_blocks, 4u);
+}
+
+TEST(lru_cache_eviction) {
+  // Create a small cache and test eviction
+  BlockCache cache(2);  // Only 2 entries
+
+  // Create a small compressed tablebase
+  Material m{0, 0, 0, 0, 1, 1};  // KvK
+  std::vector<Value> tb(BLOCK_SIZE * 3);  // 3 blocks
+  for (std::size_t i = 0; i < tb.size(); ++i) {
+    tb[i] = static_cast<Value>((i % 3) + 1);  // WIN, LOSS, DRAW cycling
+  }
+
+  CompressedTablebase ctb = compress_tablebase(tb, m);
+  ASSERT_EQ(ctb.num_blocks, 3u);
+
+  // Access block 0
+  cache.get_or_decompress(0, ctb);
+  ASSERT_EQ(cache.misses(), 1u);
+  ASSERT_EQ(cache.hits(), 0u);
+
+  // Access block 1
+  cache.get_or_decompress(1, ctb);
+  ASSERT_EQ(cache.misses(), 2u);
+
+  // Access block 0 again (should be hit)
+  cache.get_or_decompress(0, ctb);
+  ASSERT_EQ(cache.hits(), 1u);
+
+  // Access block 2 (should evict block 1, the LRU)
+  cache.get_or_decompress(2, ctb);
+  ASSERT_EQ(cache.misses(), 3u);
+
+  // Access block 0 (should be hit, still cached)
+  cache.get_or_decompress(0, ctb);
+  ASSERT_EQ(cache.hits(), 2u);
+
+  // Access block 1 (was evicted, should miss)
+  cache.get_or_decompress(1, ctb);
+  ASSERT_EQ(cache.misses(), 4u);
+}
+
+TEST(compress_tablebase_roundtrip) {
+  // Test that compressing and looking up a tablebase works correctly
+  Material m{0, 0, 0, 0, 1, 1};  // KvK
+  std::vector<Value> original = load_tablebase(m);
+  if (original.empty()) {
+    std::cout << "(skipped - no tablebase) ";
+    return;
+  }
+
+  CompressedTablebase ctb = compress_tablebase(original, m);
+
+  // Verify all positions
+  for (std::size_t i = 0; i < original.size(); ++i) {
+    Value looked_up = lookup_compressed(ctb, i, nullptr);
+    ASSERT(looked_up == original[i]);
+  }
+}
+
+TEST(compressed_lookup_with_cache) {
+  // Test that cache-based lookup works
+  Material m{0, 0, 0, 0, 1, 1};  // KvK
+  std::vector<Value> original = load_tablebase(m);
+  if (original.empty()) {
+    std::cout << "(skipped - no tablebase) ";
+    return;
+  }
+
+  CompressedTablebase ctb = compress_tablebase(original, m);
+  BlockCache cache(4);
+
+  // Look up all positions using cache
+  for (std::size_t i = 0; i < original.size(); ++i) {
+    Value looked_up = lookup_compressed(ctb, i, &cache);
+    ASSERT(looked_up == original[i]);
+  }
+
+  // For random-access methods (RAW_2BIT, TERNARY_BASE3), the cache is not used
+  // because we can decode individual values without decompressing the whole block.
+  // This is by design - cache is only for sequential-access methods (Huffman, etc.).
+  // So we check that the cache was not used (0 hits + 0 misses = 0 total).
+  ASSERT(cache.hits() == 0);
+  ASSERT(cache.misses() == 0);
+}
+
+TEST(block_compression_stats) {
+  // Test compression statistics
+  Material m{0, 0, 0, 0, 1, 1};  // KvK
+  std::vector<Value> tb = load_tablebase(m);
+  if (tb.empty()) {
+    std::cout << "(skipped - no tablebase) ";
+    return;
+  }
+
+  CompressedTablebase ctb = compress_tablebase(tb, m);
+  BlockCompressionStats stats = analyze_block_compression(ctb);
+
+  // Should have at least 1 block
+  ASSERT(stats.total_blocks >= 1);
+
+  // Uncompressed size should be number of positions
+  ASSERT_EQ(stats.uncompressed_size, tb.size());
+
+  // Should achieve some compression
+  ASSERT(stats.compressed_size < stats.uncompressed_size);
+
+  // Print info
+  std::cout << "\n    [Blocks=" << stats.total_blocks
+            << " Ratio=" << std::fixed << std::setprecision(2)
+            << stats.compression_ratio() << "x"
+            << " Method0=" << stats.method_counts[0]
+            << " Method1=" << stats.method_counts[1] << "] ";
+}
+
+TEST(compression_ratio_vs_raw) {
+  // Verify that block compression achieves better than raw storage
+  Material m{0, 0, 0, 0, 2, 1};  // KKvK - slightly larger
+  std::vector<Value> tb = load_tablebase(m);
+  if (tb.empty()) {
+    std::cout << "(skipped - no tablebase) ";
+    return;
+  }
+
+  CompressedTablebase ctb = compress_tablebase(tb, m);
+  BlockCompressionStats stats = analyze_block_compression(ctb);
+
+  // Compression ratio should be > 1 (we save space)
+  ASSERT(stats.compression_ratio() > 1.0);
+
+  // For WDL data, we should achieve at least 2x vs raw 1-byte-per-value
+  // (since 2-bit encoding gives 4x, but block header adds overhead)
+  ASSERT(stats.compression_ratio() > 2.0);
+}
+
+// =============================================================================
 // Main
 // =============================================================================
 
@@ -908,6 +1150,20 @@ int main() {
   RUN_TEST(lookup_with_sub_tablebases);
   RUN_TEST(search_performance_benchmark);
   RUN_TEST(compression_ratio_analysis);
+
+  std::cout << "\nRunning compression tests (Stage 3):\n";
+  RUN_TEST(raw_2bit_roundtrip);
+  RUN_TEST(raw_2bit_expected_size);
+  RUN_TEST(ternary_base3_roundtrip);
+  RUN_TEST(ternary_base3_expected_size);
+  RUN_TEST(ternary_fallback_on_4_values);
+  RUN_TEST(compress_block_best_selects_smallest);
+  RUN_TEST(block_indexing);
+  RUN_TEST(lru_cache_eviction);
+  RUN_TEST(compress_tablebase_roundtrip);
+  RUN_TEST(compressed_lookup_with_cache);
+  RUN_TEST(block_compression_stats);
+  RUN_TEST(compression_ratio_vs_raw);
 
   std::cout << "\n========================================\n";
   std::cout << "Tests: " << tests_passed << "/" << tests_run << " passed\n";

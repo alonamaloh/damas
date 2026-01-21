@@ -156,6 +156,120 @@ struct CompressedTablebase {
 };
 
 // ============================================================================
+// Block Compression/Decompression (Stage 3)
+// ============================================================================
+
+// Compress a block of values using the specified method.
+// Returns the compressed data (without header).
+std::vector<std::uint8_t> compress_block(
+    const Value* values,
+    std::size_t count,
+    CompressionMethod method);
+
+// Decompress a block of data using the specified method.
+// Returns the decompressed values.
+std::vector<Value> decompress_block(
+    const std::uint8_t* data,
+    std::size_t data_size,
+    std::size_t num_values,
+    CompressionMethod method);
+
+// Try all compression methods and return the best one.
+// Returns (method, compressed_data).
+std::pair<CompressionMethod, std::vector<std::uint8_t>> compress_block_best(
+    const Value* values,
+    std::size_t count);
+
+// Get the expected compressed size for a method (for method 0 and 1).
+// Returns 0 if size cannot be determined without actually compressing.
+std::size_t expected_compressed_size(std::size_t num_values, CompressionMethod method);
+
+// ============================================================================
+// LRU Cache for Decompressed Blocks (Stage 3)
+// ============================================================================
+
+#include <list>
+
+// LRU cache for decompressed blocks.
+// Used for sequential-access compression methods that require full block decompression.
+class BlockCache {
+public:
+  static constexpr std::size_t DEFAULT_CACHE_SIZE = 16;
+
+  explicit BlockCache(std::size_t max_size = DEFAULT_CACHE_SIZE);
+
+  // Get or decompress a block.
+  // Returns pointer to the cached block data (valid until next access).
+  const std::vector<Value>* get_or_decompress(
+      std::uint32_t block_idx,
+      const CompressedTablebase& tb);
+
+  // Clear the cache.
+  void clear();
+
+  // Statistics
+  std::size_t hits() const { return hits_; }
+  std::size_t misses() const { return misses_; }
+  double hit_rate() const {
+    std::size_t total = hits_ + misses_;
+    return total > 0 ? static_cast<double>(hits_) / total : 0.0;
+  }
+
+private:
+  std::size_t max_size_;
+  std::size_t hits_ = 0;
+  std::size_t misses_ = 0;
+
+  // LRU list: front = most recently used, back = least recently used
+  std::list<std::pair<std::uint32_t, std::vector<Value>>> lru_list_;
+  std::unordered_map<std::uint32_t, decltype(lru_list_)::iterator> cache_map_;
+};
+
+// ============================================================================
+// CompressedTablebase Creation and Lookup (Stage 3)
+// ============================================================================
+
+// Create a compressed tablebase from a vector of values.
+CompressedTablebase compress_tablebase(
+    const std::vector<Value>& values,
+    const Material& m);
+
+// Look up a single value in a compressed tablebase.
+// For random-access methods, this is O(1).
+// For sequential-access methods, uses the provided cache (or decompresses on-demand).
+Value lookup_compressed(
+    const CompressedTablebase& tb,
+    std::size_t index,
+    BlockCache* cache = nullptr);
+
+// Look up a value with search for don't-care positions.
+// Combines compressed lookup with the search algorithm from Stage 2.
+Value lookup_compressed_with_search(
+    const Board& b,
+    const CompressedTablebase& tb,
+    BlockCache* cache = nullptr);
+
+// ============================================================================
+// Compression Statistics (Stage 3)
+// ============================================================================
+
+struct BlockCompressionStats {
+  std::size_t total_blocks = 0;
+  std::size_t method_counts[4] = {0, 0, 0, 0};  // Count per method
+  std::size_t uncompressed_size = 0;
+  std::size_t compressed_size = 0;
+
+  double compression_ratio() const {
+    return uncompressed_size > 0
+      ? static_cast<double>(uncompressed_size) / compressed_size
+      : 1.0;
+  }
+};
+
+// Analyze compression statistics for a compressed tablebase.
+BlockCompressionStats analyze_block_compression(const CompressedTablebase& tb);
+
+// ============================================================================
 // File Format Constants (Stage 5)
 // ============================================================================
 
