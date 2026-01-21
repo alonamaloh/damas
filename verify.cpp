@@ -104,9 +104,17 @@ bool verify_position(const Board& board, Value expected_wdl, DTM expected_dtm,
 
     if (succ_wdl == Value::LOSS) {
       found_loss = true;
-      // Track highest (least negative) LOSS DTM for WIN verification
-      if (succ_dtm != DTM_UNKNOWN && (best_opp_loss == DTM_UNKNOWN || succ_dtm > best_opp_loss)) {
-        best_opp_loss = succ_dtm;
+      // Track quickest loss for opponent (we want fastest win)
+      // DTM_LOSS_TERMINAL (-128) = 0 moves, is best
+      // Otherwise, highest (least negative) = fewest moves
+      if (succ_dtm != DTM_UNKNOWN) {
+        if (best_opp_loss == DTM_UNKNOWN) {
+          best_opp_loss = succ_dtm;
+        } else if (succ_dtm == DTM_LOSS_TERMINAL) {
+          best_opp_loss = DTM_LOSS_TERMINAL;  // Terminal is always fastest
+        } else if (best_opp_loss != DTM_LOSS_TERMINAL && succ_dtm > best_opp_loss) {
+          best_opp_loss = succ_dtm;
+        }
       }
     }
     if (succ_wdl != Value::WIN) {

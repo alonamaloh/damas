@@ -1068,9 +1068,10 @@ std::vector<DTM> generate_dtm(
     iteration++;
 
     for (std::size_t idx = 0; idx < size; ++idx) {
-      if (dtm[idx] != DTM_UNKNOWN) continue;
-
       Value val = wdl[idx];
+
+      // Skip DRAW positions (already set) and positions without valid WDL
+      if (val == Value::DRAW) continue;
 
       if (val == Value::WIN) {
         // Find opponent's quickest LOSS (highest negative DTM = fewest moves)
@@ -1104,8 +1105,14 @@ std::vector<DTM> generate_dtm(
 
           // Losses are negative (< 0), excluding UNKNOWN
           if (succ_dtm < DTM_DRAW && succ_dtm != DTM_UNKNOWN) {
-            // Track highest (least negative = quickest loss for opponent)
-            if (best_succ == DTM_UNKNOWN || succ_dtm > best_succ) {
+            // Track quickest loss for opponent (we want to win fast)
+            // DTM_LOSS_TERMINAL (-128) = 0 moves, is best
+            // Otherwise, highest (least negative) = fewest moves
+            if (best_succ == DTM_UNKNOWN) {
+              best_succ = succ_dtm;
+            } else if (succ_dtm == DTM_LOSS_TERMINAL) {
+              best_succ = DTM_LOSS_TERMINAL;  // Terminal is always fastest
+            } else if (best_succ != DTM_LOSS_TERMINAL && succ_dtm > best_succ) {
               best_succ = succ_dtm;
             }
           }
@@ -1114,8 +1121,12 @@ std::vector<DTM> generate_dtm(
         if (best_succ != DTM_UNKNOWN) {
           // WIN in (opponent's loss moves + 1) moves
           int opp_moves = (best_succ == DTM_LOSS_TERMINAL) ? 0 : -best_succ;
-          dtm[idx] = dtm_win(opp_moves + 1);
-          changed = true;
+          DTM new_dtm = dtm_win(opp_moves + 1);
+          // Only update if unknown or if this is a faster win (smaller DTM)
+          if (dtm[idx] == DTM_UNKNOWN || new_dtm < dtm[idx]) {
+            dtm[idx] = new_dtm;
+            changed = true;
+          }
         }
       } else if (val == Value::LOSS) {
         // Find opponent's slowest WIN (highest positive DTM = most moves)
@@ -1169,8 +1180,11 @@ std::vector<DTM> generate_dtm(
 
         if (all_known && best_succ != DTM_UNKNOWN) {
           // LOSS in same number of moves as opponent's WIN
-          dtm[idx] = dtm_loss(best_succ);
-          changed = true;
+          DTM new_dtm = dtm_loss(best_succ);
+          if (dtm[idx] != new_dtm) {
+            dtm[idx] = new_dtm;
+            changed = true;
+          }
         }
       }
     }
