@@ -469,6 +469,106 @@ std::vector<Value> decompress_ternary_base3(const std::uint8_t* data, std::size_
   return result;
 }
 
+// ============================================================================
+// Method 3: RLE_BINARY_SEARCH
+// Run-length encoding with 16-bit records: 14-bit index + 2-bit value.
+// Each record means "from this index until the next record, value is X".
+// Lookup is O(log n) via binary search on indices.
+// ============================================================================
+
+// Compress using RLE with 16-bit records.
+// Format: sequence of 16-bit little-endian records
+//   Bits 0-13: start index (0-16383)
+//   Bits 14-15: value (0-3)
+// Records are sorted by index. The last record covers to end of block.
+std::vector<std::uint8_t> compress_rle_binary_search(const Value* values, std::size_t count) {
+  if (count == 0) return {};
+
+  std::vector<std::uint8_t> result;
+  result.reserve(count / 100 * 2);  // Estimate: ~1% run changes
+
+  std::uint8_t current_value = value_to_int(values[0]);
+
+  // First record always starts at index 0
+  std::uint16_t record = (static_cast<std::uint16_t>(current_value) << 14) | 0;
+  result.push_back(record & 0xFF);
+  result.push_back((record >> 8) & 0xFF);
+
+  for (std::size_t i = 1; i < count; ++i) {
+    std::uint8_t v = value_to_int(values[i]);
+    if (v != current_value) {
+      // New run starts at index i
+      current_value = v;
+      record = (static_cast<std::uint16_t>(v) << 14) | static_cast<std::uint16_t>(i);
+      result.push_back(record & 0xFF);
+      result.push_back((record >> 8) & 0xFF);
+    }
+  }
+
+  return result;
+}
+
+std::vector<Value> decompress_rle_binary_search(const std::uint8_t* data, std::size_t data_size, std::size_t num_values) {
+  if (num_values == 0 || data_size < 2) return std::vector<Value>(num_values, Value::UNKNOWN);
+
+  std::vector<Value> result(num_values);
+  std::size_t num_records = data_size / 2;
+
+  // Decode all records
+  std::vector<std::pair<std::size_t, Value>> runs;
+  runs.reserve(num_records);
+
+  for (std::size_t i = 0; i < num_records; ++i) {
+    std::uint16_t record = data[i * 2] | (data[i * 2 + 1] << 8);
+    std::size_t start_idx = record & 0x3FFF;
+    std::uint8_t val = (record >> 14) & 0x3;
+    runs.emplace_back(start_idx, int_to_value(val));
+  }
+
+  // Fill result by iterating through runs
+  for (std::size_t r = 0; r < runs.size(); ++r) {
+    std::size_t start = runs[r].first;
+    std::size_t end = (r + 1 < runs.size()) ? runs[r + 1].first : num_values;
+    Value val = runs[r].second;
+
+    for (std::size_t i = start; i < end; ++i) {
+      result[i] = val;
+    }
+  }
+
+  return result;
+}
+
+// Lookup a single value using binary search on RLE records.
+// Returns the value at the given index.
+Value lookup_rle_binary_search(const std::uint8_t* data, std::size_t data_size, std::size_t index) {
+  std::size_t num_records = data_size / 2;
+  if (num_records == 0) return Value::UNKNOWN;
+
+  // Binary search to find the record that covers this index.
+  // We want the largest start_idx <= index.
+  std::size_t lo = 0, hi = num_records;
+
+  while (lo < hi) {
+    std::size_t mid = lo + (hi - lo) / 2;
+    std::uint16_t record = data[mid * 2] | (data[mid * 2 + 1] << 8);
+    std::size_t start_idx = record & 0x3FFF;
+
+    if (start_idx <= index) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+
+  // lo is now the first record with start_idx > index, so lo-1 is our record
+  if (lo == 0) return Value::UNKNOWN;  // Shouldn't happen if data is valid
+
+  std::uint16_t record = data[(lo - 1) * 2] | (data[(lo - 1) * 2 + 1] << 8);
+  std::uint8_t val = (record >> 14) & 0x3;
+  return int_to_value(val);
+}
+
 } // anonymous namespace
 
 std::vector<std::uint8_t> compress_block(
@@ -487,8 +587,10 @@ std::vector<std::uint8_t> compress_block(
       // Fall back to raw 2-bit if ternary not possible
       return compress_raw_2bit(values, count);
 
-    case CompressionMethod::DEFAULT_EXCEPTIONS:
     case CompressionMethod::RLE_BINARY_SEARCH:
+      return compress_rle_binary_search(values, count);
+
+    case CompressionMethod::DEFAULT_EXCEPTIONS:
       // Not implemented yet - fall back to raw 2-bit
       return compress_raw_2bit(values, count);
 
@@ -499,7 +601,7 @@ std::vector<std::uint8_t> compress_block(
 
 std::vector<Value> decompress_block(
     const std::uint8_t* data,
-    std::size_t /*data_size*/,
+    std::size_t data_size,
     std::size_t num_values,
     CompressionMethod method) {
 
@@ -510,8 +612,10 @@ std::vector<Value> decompress_block(
     case CompressionMethod::TERNARY_BASE3:
       return decompress_ternary_base3(data, num_values);
 
-    case CompressionMethod::DEFAULT_EXCEPTIONS:
     case CompressionMethod::RLE_BINARY_SEARCH:
+      return decompress_rle_binary_search(data, data_size, num_values);
+
+    case CompressionMethod::DEFAULT_EXCEPTIONS:
       // Not implemented yet - assume raw 2-bit
       return decompress_raw_2bit(data, num_values);
 
@@ -538,7 +642,12 @@ std::pair<CompressionMethod, std::vector<std::uint8_t>> compress_block_best(
     }
   }
 
-  // Methods 2 and 3 not implemented yet
+  // Try Method 3: RLE_BINARY_SEARCH (always available)
+  auto rle = compress_rle_binary_search(values, count);
+  if (rle.size() < best_data.size()) {
+    best_method = CompressionMethod::RLE_BINARY_SEARCH;
+    best_data = std::move(rle);
+  }
 
   return {best_method, std::move(best_data)};
 }
@@ -708,6 +817,12 @@ Value lookup_compressed(
     std::uint8_t ternary_val = byte % 3;
 
     return int_to_value(reverse_mapping[ternary_val]);
+  }
+
+  if (method == CompressionMethod::RLE_BINARY_SEARCH) {
+    std::uint16_t compressed_size = block_ptr[1] | (block_ptr[2] << 8);
+    const std::uint8_t* data = block_ptr + 3;
+    return lookup_rle_binary_search(data, compressed_size, idx_in_block);
   }
 
   // For sequential-access methods, use cache

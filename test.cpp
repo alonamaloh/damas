@@ -923,18 +923,20 @@ TEST(ternary_fallback_on_4_values) {
 }
 
 TEST(compress_block_best_selects_smallest) {
-  // Create a block with only 3 values - ternary should be chosen
+  // Create a block where ternary is better than raw but RLE might win.
+  // With isolated value changes, RLE has many runs.
   std::vector<Value> values(100, Value::WIN);
   values[50] = Value::LOSS;
   values[75] = Value::DRAW;
 
   auto [method, data] = compress_block_best(values.data(), values.size());
 
-  // Ternary should be selected as it's smaller
   // Raw: 100/4 = 25 bytes
   // Ternary: 1 + 100/5 = 21 bytes
-  ASSERT(method == CompressionMethod::TERNARY_BASE3);
-  ASSERT_EQ(data.size(), 21u);
+  // RLE: 5 runs (WIN->LOSS->WIN->DRAW->WIN) = 10 bytes
+  // RLE should be selected as smallest
+  ASSERT(method == CompressionMethod::RLE_BINARY_SEARCH);
+  ASSERT_EQ(data.size(), 10u);
 }
 
 TEST(block_indexing) {
@@ -1087,6 +1089,118 @@ TEST(compression_ratio_vs_raw) {
   ASSERT(stats.compression_ratio() > 2.0);
 }
 
+TEST(rle_binary_search_roundtrip) {
+  // Test that RLE compression round-trips correctly
+  // Create a block with runs: WIN x 100, LOSS x 50, DRAW x 100, WIN x 50
+  std::vector<Value> values;
+  for (int i = 0; i < 100; ++i) values.push_back(Value::WIN);
+  for (int i = 0; i < 50; ++i) values.push_back(Value::LOSS);
+  for (int i = 0; i < 100; ++i) values.push_back(Value::DRAW);
+  for (int i = 0; i < 50; ++i) values.push_back(Value::WIN);
+
+  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::RLE_BINARY_SEARCH);
+  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::RLE_BINARY_SEARCH);
+
+  ASSERT_EQ(decompressed.size(), values.size());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    ASSERT(decompressed[i] == values[i]);
+  }
+
+  // Should have 4 runs = 4 records = 8 bytes
+  ASSERT_EQ(compressed.size(), 8u);
+}
+
+TEST(rle_single_run) {
+  // Block with all same value = 1 record = 2 bytes
+  std::vector<Value> values(1000, Value::DRAW);
+
+  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::RLE_BINARY_SEARCH);
+  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::RLE_BINARY_SEARCH);
+
+  ASSERT_EQ(decompressed.size(), values.size());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    ASSERT(decompressed[i] == Value::DRAW);
+  }
+
+  // 1 run = 1 record = 2 bytes
+  ASSERT_EQ(compressed.size(), 2u);
+}
+
+TEST(rle_alternating) {
+  // Worst case: alternating values = many runs
+  std::vector<Value> values;
+  for (int i = 0; i < 100; ++i) {
+    values.push_back(i % 2 == 0 ? Value::WIN : Value::LOSS);
+  }
+
+  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::RLE_BINARY_SEARCH);
+  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::RLE_BINARY_SEARCH);
+
+  ASSERT_EQ(decompressed.size(), values.size());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    ASSERT(decompressed[i] == values[i]);
+  }
+
+  // 100 runs = 100 records = 200 bytes (worse than raw 25 bytes)
+  ASSERT_EQ(compressed.size(), 200u);
+}
+
+TEST(rle_binary_search_lookup) {
+  // Test O(log n) lookup directly
+  std::vector<Value> values;
+  for (int i = 0; i < 100; ++i) values.push_back(Value::WIN);
+  for (int i = 0; i < 50; ++i) values.push_back(Value::LOSS);
+  for (int i = 0; i < 100; ++i) values.push_back(Value::DRAW);
+  for (int i = 0; i < 50; ++i) values.push_back(Value::WIN);
+
+  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::RLE_BINARY_SEARCH);
+
+  // Create a mini compressed tablebase
+  Material m{0, 0, 0, 0, 1, 1};
+  CompressedTablebase ctb;
+  ctb.material = m;
+  ctb.num_positions = static_cast<std::uint32_t>(values.size());
+  ctb.num_blocks = 1;
+  ctb.block_offsets.push_back(0);
+
+  // Add block header + data
+  ctb.block_data.push_back(static_cast<std::uint8_t>(CompressionMethod::RLE_BINARY_SEARCH));
+  std::uint16_t size = static_cast<std::uint16_t>(compressed.size());
+  ctb.block_data.push_back(size & 0xFF);
+  ctb.block_data.push_back((size >> 8) & 0xFF);
+  ctb.block_data.insert(ctb.block_data.end(), compressed.begin(), compressed.end());
+
+  // Test lookups at various positions
+  ASSERT(lookup_compressed(ctb, 0, nullptr) == Value::WIN);
+  ASSERT(lookup_compressed(ctb, 50, nullptr) == Value::WIN);
+  ASSERT(lookup_compressed(ctb, 99, nullptr) == Value::WIN);
+  ASSERT(lookup_compressed(ctb, 100, nullptr) == Value::LOSS);
+  ASSERT(lookup_compressed(ctb, 125, nullptr) == Value::LOSS);
+  ASSERT(lookup_compressed(ctb, 149, nullptr) == Value::LOSS);
+  ASSERT(lookup_compressed(ctb, 150, nullptr) == Value::DRAW);
+  ASSERT(lookup_compressed(ctb, 200, nullptr) == Value::DRAW);
+  ASSERT(lookup_compressed(ctb, 249, nullptr) == Value::DRAW);
+  ASSERT(lookup_compressed(ctb, 250, nullptr) == Value::WIN);
+  ASSERT(lookup_compressed(ctb, 299, nullptr) == Value::WIN);
+}
+
+TEST(rle_best_selection) {
+  // For blocks with few runs, RLE should be selected
+  // Create a block with 2 runs spanning the whole block
+  std::vector<Value> values(BLOCK_SIZE);
+  for (std::size_t i = 0; i < BLOCK_SIZE / 2; ++i) values[i] = Value::WIN;
+  for (std::size_t i = BLOCK_SIZE / 2; i < BLOCK_SIZE; ++i) values[i] = Value::LOSS;
+
+  auto [method, data] = compress_block_best(values.data(), values.size());
+
+  // RLE: 2 records = 4 bytes
+  // RAW: 4096 bytes
+  // TERNARY: 3278 bytes (but only 2 distinct values, so ternary works too)
+  // RLE should be selected as smallest
+  ASSERT(method == CompressionMethod::RLE_BINARY_SEARCH);
+  ASSERT_EQ(data.size(), 4u);
+}
+
 // =============================================================================
 // Main
 // =============================================================================
@@ -1164,6 +1278,13 @@ int main() {
   RUN_TEST(compressed_lookup_with_cache);
   RUN_TEST(block_compression_stats);
   RUN_TEST(compression_ratio_vs_raw);
+
+  std::cout << "\nRunning RLE compression tests:\n";
+  RUN_TEST(rle_binary_search_roundtrip);
+  RUN_TEST(rle_single_run);
+  RUN_TEST(rle_alternating);
+  RUN_TEST(rle_binary_search_lookup);
+  RUN_TEST(rle_best_selection);
 
   std::cout << "\n========================================\n";
   std::cout << "Tests: " << tests_passed << "/" << tests_run << " passed\n";
