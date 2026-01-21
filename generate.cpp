@@ -698,11 +698,15 @@ void solve_pair_threadsafe(const Material& m1, const Material& m2) {
 // Solve all materials up to max_pieces in parallel using dependency graph
 // A material can start processing as soon as all its actual dependencies are done,
 // not when all materials at a "lower level" are done.
-void solve_all_parallel(int max_pieces) {
+// If load_existing is true, try to load tablebases from disk instead of generating.
+void solve_all_parallel(int max_pieces, bool load_existing = false) {
   std::vector<Material> all = all_materials(max_pieces);
 
   std::cout << "=== Parallel Tablebase Generation ===" << std::endl;
   std::cout << "Using " << omp_get_max_threads() << " threads" << std::endl;
+  if (load_existing) {
+    std::cout << "Mode: Load existing tablebases from disk when available" << std::endl;
+  }
   std::cout << "Total materials: " << all.size() << std::endl;
 
   // Canonicalize materials: for asymmetric pairs, pick one representative
@@ -819,10 +823,35 @@ void solve_all_parallel(int max_pieces) {
 
       // Process this material
       Material f = flip(m);
-      if (m == f) {
-        solve_single_threadsafe(m);
-      } else {
-        solve_pair_threadsafe(m, f);
+      bool loaded_from_disk = false;
+
+      if (load_existing) {
+        // Try to load from disk
+        std::vector<Value> tb_m = load_tablebase(m);
+        if (!tb_m.empty()) {
+          store_wdl_tablebase(m, std::move(tb_m));
+          if (!(f == m)) {
+            std::vector<Value> tb_f = load_tablebase(f);
+            if (!tb_f.empty()) {
+              store_wdl_tablebase(f, std::move(tb_f));
+              loaded_from_disk = true;
+              #pragma omp critical
+              std::cout << "[Thread " << omp_get_thread_num() << "] Loaded " << m << " <-> " << f << " from disk" << std::endl;
+            }
+          } else {
+            loaded_from_disk = true;
+            #pragma omp critical
+            std::cout << "[Thread " << omp_get_thread_num() << "] Loaded " << m << " from disk" << std::endl;
+          }
+        }
+      }
+
+      if (!loaded_from_disk) {
+        if (m == f) {
+          solve_single_threadsafe(m);
+        } else {
+          solve_pair_threadsafe(m, f);
+        }
       }
 
       // Update dependents
@@ -908,14 +937,16 @@ void solve(const Material& m,
 }
 
 void print_usage(const char* program) {
-  std::cerr << "Usage: " << program << " [--dtm] <back_w> <back_b> <other_w> <other_b> <queens_w> <queens_b>" << std::endl;
-  std::cerr << "       " << program << " [--dtm] --kvk     (generate queen vs queen)" << std::endl;
-  std::cerr << "       " << program << " [--dtm] --kvp     (generate queen vs pawn)" << std::endl;
-  std::cerr << "       " << program << " [--dtm] --all <n> (generate all with up to n pieces)" << std::endl;
+  std::cerr << "Usage: " << program << " [options] <back_w> <back_b> <other_w> <other_b> <queens_w> <queens_b>" << std::endl;
+  std::cerr << "       " << program << " [options] --kvk     (generate queen vs queen)" << std::endl;
+  std::cerr << "       " << program << " [options] --kvp     (generate queen vs pawn)" << std::endl;
+  std::cerr << "       " << program << " [options] --all <n> (generate all with up to n pieces)" << std::endl;
   std::cerr << std::endl;
   std::cerr << "Options:" << std::endl;
-  std::cerr << "  --dtm    Generate DTM (distance-to-mate) instead of WDL" << std::endl;
-  std::cerr << "           Requires WDL tablebases to exist first" << std::endl;
+  std::cerr << "  --dtm           Generate DTM (distance-to-mate) instead of WDL" << std::endl;
+  std::cerr << "                  Requires WDL tablebases to exist first" << std::endl;
+  std::cerr << "  --load-existing Load existing tablebases from disk instead of regenerating" << std::endl;
+  std::cerr << "                  Useful for resuming interrupted generation" << std::endl;
 }
 
 // Generate all material configurations with up to n total pieces
@@ -1387,20 +1418,29 @@ void solve_dtm(const Material& m,
 } // namespace
 
 int main(int argc, char* argv[]) {
-  // Check for --dtm flag
+  // Parse option flags
   bool generate_dtm_flag = false;
+  bool load_existing_flag = false;
   int arg_offset = 1;
 
-  if (argc >= 2 && std::strcmp(argv[1], "--dtm") == 0) {
-    generate_dtm_flag = true;
-    arg_offset = 2;
-    argc--;  // Adjust argc for subsequent checks
+  while (arg_offset < argc && argv[arg_offset][0] == '-' && argv[arg_offset][1] == '-') {
+    if (std::strcmp(argv[arg_offset], "--dtm") == 0) {
+      generate_dtm_flag = true;
+      arg_offset++;
+    } else if (std::strcmp(argv[arg_offset], "--load-existing") == 0) {
+      load_existing_flag = true;
+      arg_offset++;
+    } else {
+      break;  // Not an option flag, must be a command
+    }
   }
+
+  int remaining_argc = argc - arg_offset + 1;  // +1 to account for program name
 
   std::unordered_map<Material, std::vector<Value>> wdl_tablebases;
   std::unordered_map<Material, std::vector<DTM>> dtm_tablebases;
 
-  if (argc == 2 && std::strcmp(argv[arg_offset], "--kvk") == 0) {
+  if (remaining_argc == 2 && std::strcmp(argv[arg_offset], "--kvk") == 0) {
     // Queen vs Queen
     Material m{0, 0, 0, 0, 1, 1};
     if (generate_dtm_flag) {
@@ -1408,7 +1448,7 @@ int main(int argc, char* argv[]) {
     } else {
       solve(m, wdl_tablebases);
     }
-  } else if (argc == 2 && std::strcmp(argv[arg_offset], "--kvp") == 0) {
+  } else if (remaining_argc == 2 && std::strcmp(argv[arg_offset], "--kvp") == 0) {
     // Queen vs Pawn (all variants)
     std::cout << "=== Queen vs Pawn ===" << std::endl;
     if (generate_dtm_flag) {
@@ -1418,7 +1458,7 @@ int main(int argc, char* argv[]) {
       solve(Material{0, 0, 0, 1, 1, 0}, wdl_tablebases);
       solve(Material{0, 1, 0, 0, 1, 0}, wdl_tablebases);
     }
-  } else if (argc == 3 && std::strcmp(argv[arg_offset], "--all") == 0) {
+  } else if (remaining_argc == 3 && std::strcmp(argv[arg_offset], "--all") == 0) {
     int max_pieces = std::atoi(argv[arg_offset + 1]);
     if (max_pieces < 2 || max_pieces > 8) {
       std::cerr << "Max pieces must be between 2 and 8" << std::endl;
@@ -1435,9 +1475,9 @@ int main(int argc, char* argv[]) {
       }
     } else {
       // WDL generation uses parallel solver
-      solve_all_parallel(max_pieces);
+      solve_all_parallel(max_pieces, load_existing_flag);
     }
-  } else if (argc == 7) {
+  } else if (remaining_argc == 7) {
     Material m{
       std::atoi(argv[arg_offset]),
       std::atoi(argv[arg_offset + 1]),
