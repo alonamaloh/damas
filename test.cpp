@@ -1415,6 +1415,125 @@ TEST(huffman_best_vs_rle) {
   ASSERT_EQ(data.size(), 4u);
 }
 
+// ============================================================================
+// File I/O Tests (Stage 5)
+// ============================================================================
+
+TEST(compressed_file_roundtrip) {
+  // Test save/load of compressed tablebase
+  Material m{0, 0, 0, 0, 1, 1};  // KvK
+  std::vector<Value> original = load_tablebase(m);
+  if (original.empty()) {
+    std::cout << "(skipped - no tablebase) ";
+    return;
+  }
+
+  // Compress
+  CompressedTablebase ctb = compress_tablebase(original, m);
+
+  // Save to temp file
+  std::string temp_file = "/tmp/test_cwdl_000011.bin";
+  ASSERT(save_compressed_tablebase(ctb, temp_file));
+
+  // Load back
+  CompressedTablebase loaded = load_compressed_tablebase(temp_file);
+  ASSERT(!loaded.empty());
+  ASSERT_EQ(loaded.num_positions, ctb.num_positions);
+  ASSERT_EQ(loaded.num_blocks, ctb.num_blocks);
+  ASSERT(loaded.material == ctb.material);
+
+  // Verify all values match using lookup_compressed_with_search
+  BlockCache cache(4);
+  for (std::size_t i = 0; i < original.size(); ++i) {
+    Board b = index_to_board(i, m);
+    Value looked_up = lookup_compressed_with_search(b, loaded, &cache);
+    ASSERT(looked_up == original[i]);
+  }
+
+  // Clean up
+  std::remove(temp_file.c_str());
+}
+
+TEST(compressed_lookup_non_tense_positions) {
+  // Test that non-tense positions have correct values after compression.
+  // This is the key correctness test: compression extends runs through tense
+  // positions, but non-tense positions must retain their correct values.
+  Material m{0, 0, 0, 0, 1, 1};  // KvK
+  std::vector<Value> original = load_tablebase(m);
+  if (original.empty()) {
+    std::cout << "(skipped - no tablebase) ";
+    return;
+  }
+
+  // Compress
+  CompressedTablebase ctb = compress_tablebase(original, m);
+
+  // Check all non-tense positions - they should have correct stored values
+  std::size_t non_tense_count = 0;
+  std::size_t tense_count = 0;
+
+  for (std::size_t i = 0; i < original.size(); ++i) {
+    Board b = index_to_board(i, m);
+
+    if (has_captures(b)) {
+      tense_count++;
+      // Tense positions may have modified stored values, but
+      // lookup_compressed_with_search should still return correct result
+      Value looked_up = lookup_compressed_with_search(b, ctb, nullptr);
+      ASSERT(looked_up == original[i]);
+    } else {
+      non_tense_count++;
+      // Non-tense positions MUST have correct stored values
+      Value stored = lookup_compressed(ctb, i, nullptr);
+      ASSERT(stored == original[i]);
+    }
+  }
+
+  // Print statistics
+  std::cout << "(non-tense=" << non_tense_count << " tense=" << tense_count << ") ";
+}
+
+TEST(compressed_multiple_materials) {
+  // Test compression across multiple material configurations.
+  // We verify that non-tense positions have correct stored values.
+  // (Tense positions are handled by search, which would need sub-tablebases
+  // for materials with captures that change material.)
+  Material materials[] = {
+    {0, 0, 0, 0, 1, 1},  // KvK
+    {0, 0, 0, 0, 2, 1},  // KKvK
+    {0, 0, 1, 0, 1, 1},  // KPvK
+    {0, 0, 0, 1, 1, 1},  // KvKP
+  };
+
+  int tested = 0;
+  for (const Material& m : materials) {
+    std::vector<Value> original = load_tablebase(m);
+    if (original.empty()) continue;
+
+    tested++;
+
+    // Compress and verify
+    CompressedTablebase ctb = compress_tablebase(original, m);
+
+    // Verify non-tense positions have correct stored values
+    for (std::size_t i = 0; i < original.size(); i += 100) {
+      Board b = index_to_board(i, m);
+
+      // Only check non-tense positions (they must have correct stored values)
+      if (!has_captures(b)) {
+        Value stored = lookup_compressed(ctb, i, nullptr);
+        ASSERT(stored == original[i]);
+      }
+    }
+  }
+
+  if (tested == 0) {
+    std::cout << "(skipped - no tablebases) ";
+  } else {
+    std::cout << "(tested " << tested << " materials) ";
+  }
+}
+
 // =============================================================================
 // Main
 // =============================================================================
@@ -1513,6 +1632,11 @@ int main() {
   RUN_TEST(huffman_single_value_block);
   RUN_TEST(huffman_alternating);
   RUN_TEST(huffman_best_vs_rle);
+
+  std::cout << "\nRunning File I/O tests (Stage 5):\n";
+  RUN_TEST(compressed_file_roundtrip);
+  RUN_TEST(compressed_lookup_non_tense_positions);
+  RUN_TEST(compressed_multiple_materials);
 
   std::cout << "\n========================================\n";
   std::cout << "Tests: " << tests_passed << "/" << tests_run << " passed\n";

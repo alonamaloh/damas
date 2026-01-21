@@ -1,10 +1,12 @@
 #include "compression.h"
 #include "movegen.h"
 #include <algorithm>
-#include <filesystem>
-#include <iostream>
-#include <iomanip>
 #include <cmath>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
 
 // Forward declarations for Huffman RLE functions
 std::vector<std::uint8_t> compress_huffman_rle(const Value* values, std::size_t count,
@@ -1218,7 +1220,7 @@ BlockCompressionStats analyze_block_compression(const CompressedTablebase& tb) {
     CompressionMethod method = static_cast<CompressionMethod>(block_ptr[0]);
     std::uint16_t compressed_size = block_ptr[1] | (block_ptr[2] << 8);
 
-    if (static_cast<int>(method) < 8) {
+    if (static_cast<int>(method) < 16) {
       stats.method_counts[static_cast<int>(method)]++;
     }
 
@@ -2304,4 +2306,110 @@ std::vector<Value> decompress_rle_huffman_2val(const std::uint8_t* data, std::si
   }
 
   return result;
+}
+
+// ============================================================================
+// Compressed Tablebase File I/O (Stage 5)
+// ============================================================================
+
+bool save_compressed_tablebase(const CompressedTablebase& tb, const std::string& filename) {
+  std::ofstream file(filename, std::ios::binary);
+  if (!file) {
+    return false;
+  }
+
+  // Write magic number
+  file.write(CWDL_MAGIC, 4);
+
+  // Write version
+  file.write(reinterpret_cast<const char*>(&CWDL_VERSION), 1);
+
+  // Write material (6 bytes)
+  std::uint8_t mat[6] = {
+    static_cast<std::uint8_t>(tb.material.back_white_pawns),
+    static_cast<std::uint8_t>(tb.material.back_black_pawns),
+    static_cast<std::uint8_t>(tb.material.other_white_pawns),
+    static_cast<std::uint8_t>(tb.material.other_black_pawns),
+    static_cast<std::uint8_t>(tb.material.white_queens),
+    static_cast<std::uint8_t>(tb.material.black_queens)
+  };
+  file.write(reinterpret_cast<const char*>(mat), 6);
+
+  // Write num_positions (4 bytes, little-endian)
+  file.write(reinterpret_cast<const char*>(&tb.num_positions), 4);
+
+  // Write num_blocks (4 bytes, little-endian)
+  file.write(reinterpret_cast<const char*>(&tb.num_blocks), 4);
+
+  // Write block offsets (4 bytes each)
+  file.write(reinterpret_cast<const char*>(tb.block_offsets.data()),
+             tb.block_offsets.size() * sizeof(std::uint32_t));
+
+  // Write block data
+  file.write(reinterpret_cast<const char*>(tb.block_data.data()),
+             tb.block_data.size());
+
+  return file.good();
+}
+
+CompressedTablebase load_compressed_tablebase(const std::string& filename) {
+  CompressedTablebase tb;
+
+  std::ifstream file(filename, std::ios::binary);
+  if (!file) {
+    return tb;  // Return empty tablebase on error
+  }
+
+  // Read and verify magic number
+  char magic[4];
+  file.read(magic, 4);
+  if (std::memcmp(magic, CWDL_MAGIC, 4) != 0) {
+    return tb;  // Invalid magic
+  }
+
+  // Read and verify version
+  std::uint8_t version;
+  file.read(reinterpret_cast<char*>(&version), 1);
+  if (version != CWDL_VERSION) {
+    return tb;  // Unsupported version
+  }
+
+  // Read material (6 bytes)
+  std::uint8_t mat[6];
+  file.read(reinterpret_cast<char*>(mat), 6);
+  tb.material.back_white_pawns = mat[0];
+  tb.material.back_black_pawns = mat[1];
+  tb.material.other_white_pawns = mat[2];
+  tb.material.other_black_pawns = mat[3];
+  tb.material.white_queens = mat[4];
+  tb.material.black_queens = mat[5];
+
+  // Read num_positions
+  file.read(reinterpret_cast<char*>(&tb.num_positions), 4);
+
+  // Read num_blocks
+  file.read(reinterpret_cast<char*>(&tb.num_blocks), 4);
+
+  // Read block offsets
+  tb.block_offsets.resize(tb.num_blocks);
+  file.read(reinterpret_cast<char*>(tb.block_offsets.data()),
+            tb.num_blocks * sizeof(std::uint32_t));
+
+  // Calculate block data size and read it
+  // Block data starts after header (4+1+6+4+4 = 19 bytes) + offsets (4*num_blocks)
+  std::streampos current_pos = file.tellg();
+  file.seekg(0, std::ios::end);
+  std::streampos end_pos = file.tellg();
+  std::size_t block_data_size = static_cast<std::size_t>(end_pos - current_pos);
+
+  file.seekg(current_pos);
+  tb.block_data.resize(block_data_size);
+  file.read(reinterpret_cast<char*>(tb.block_data.data()), block_data_size);
+
+  if (!file.good() && !file.eof()) {
+    // Read error - return empty tablebase
+    return CompressedTablebase{};
+  }
+
+  return tb;
 }

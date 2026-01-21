@@ -281,6 +281,27 @@ constexpr char CWDL_MAGIC[4] = {'C', 'W', 'D', 'L'};
 constexpr std::uint8_t CWDL_VERSION = 1;
 
 // ============================================================================
+// Compressed Tablebase File I/O (Stage 5)
+// ============================================================================
+
+// Save a compressed tablebase to a file.
+// File format:
+//   [4 bytes]  Magic "CWDL"
+//   [1 byte]   Version
+//   [6 bytes]  Material (6 piece counts)
+//   [4 bytes]  num_positions
+//   [4 bytes]  num_blocks
+//   [4 bytes × num_blocks]  Block offsets
+//   [variable] Block data (concatenated compressed blocks)
+//
+// Returns true on success, false on error.
+bool save_compressed_tablebase(const CompressedTablebase& tb, const std::string& filename);
+
+// Load a compressed tablebase from a file.
+// Returns an empty tablebase (num_positions == 0) on error.
+CompressedTablebase load_compressed_tablebase(const std::string& filename);
+
+// ============================================================================
 // BitWriter/BitReader for Huffman Encoding (Stage 4)
 // ============================================================================
 
