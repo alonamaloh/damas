@@ -182,8 +182,6 @@ std::vector<Value> generate_tablebase(
   // predecessors[i] = list of (predecessor_index) that lead to position i
   std::vector<std::vector<std::size_t>> predecessors(size);
 
-  std::cout << "  Building predecessor graph and initializing..." << std::endl;
-
   // Phase 1: Initialize terminal positions and build predecessor graph
   for (std::size_t idx = 0; idx < size; ++idx) {
     Board board = index_to_board(idx, m);
@@ -308,8 +306,6 @@ std::vector<Value> generate_tablebase(
       unknown_successor_count[idx] = successor_count;
     }
   }
-
-  std::cout << "  Propagating values..." << std::endl;
 
   // Phase 2: Propagate using work queue
   std::queue<std::size_t> work_queue;
@@ -1028,8 +1024,6 @@ std::vector<DTM> generate_dtm(
   std::vector<std::vector<SuccessorInfo>> successors(size);
   Material flipped_m = flip(m);
 
-  std::cout << "  Building successor graph..." << std::endl;
-
   for (std::size_t idx = 0; idx < size; ++idx) {
     if (wdl[idx] == Value::DRAW) continue;  // Skip draws
 
@@ -1056,8 +1050,6 @@ std::vector<DTM> generate_dtm(
       successors[idx].push_back(info);
     }
   }
-
-  std::cout << "  Propagating DTM values..." << std::endl;
 
   // Iterate until stable (limit to 200 iterations for debugging)
   bool changed = true;
