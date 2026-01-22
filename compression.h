@@ -129,8 +129,6 @@ enum class CompressionMethod : std::uint8_t {
   RAW_2BIT = 0,           // 2 bits per value, 4 per byte (baseline)
   DEFAULT_EXCEPTIONS = 2, // Default value + sorted exception list
   RLE_BINARY_SEARCH = 3,  // Run-length encoding with binary search
-  HUFFMAN_RLE_MEDIUM = 5, // Huffman RLE optimized for medium runs (~50 avg)
-  HUFFMAN_RLE_VARIABLE = 7, // Huffman RLE for geometric distribution
   RLE_HUFFMAN_2VAL = 8,   // Optimized Huffman RLE for 2-value blocks
   RLE_HUFFMAN_3VAL = 9,   // Optimized Huffman RLE for 3-value blocks with prediction
 };

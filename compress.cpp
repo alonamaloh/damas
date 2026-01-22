@@ -111,10 +111,10 @@ int main(int argc, char* argv[]) {
 
     std::cout << "Compression method usage (blocks):\n";
     // Method IDs: 0=RAW_2BIT, 2=DEFAULT_EXCEPTIONS, 3=RLE_BINARY_SEARCH,
-    // 5=HUFFMAN_RLE_MEDIUM, 7=HUFFMAN_RLE_VARIABLE, 8=RLE_HUFFMAN_2VAL, 9=RLE_HUFFMAN_3VAL
+    // 8=RLE_HUFFMAN_2VAL, 9=RLE_HUFFMAN_3VAL
     const char* method_names[] = {
       "RAW_2BIT", nullptr, "DEFAULT_EXCEPTIONS", "RLE_BINARY_SEARCH",
-      nullptr, "HUFFMAN_RLE_MEDIUM", nullptr, "HUFFMAN_RLE_VARIABLE",
+      nullptr, nullptr, nullptr, nullptr,
       "RLE_HUFFMAN_2VAL", "RLE_HUFFMAN_3VAL"
     };
     for (int i = 0; i < 10; ++i) {

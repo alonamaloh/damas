@@ -728,7 +728,10 @@ TEST(lookup_correctness_multi_material) {
     }
   }
 
-  ASSERT(total_tested > 0);  // At least some tablebases should exist
+  if (total_tested == 0) {
+    std::cout << "(skipped - no tablebases) ";
+    return;
+  }
   ASSERT_EQ(total_errors, 0);
 }
 
@@ -1271,89 +1274,8 @@ TEST(rle_best_selection) {
 }
 
 // =============================================================================
-// Huffman RLE compression tests (Stage 4)
+// Block compression selection tests
 // =============================================================================
-
-TEST(huffman_short_roundtrip) {
-  // Test HUFFMAN_RLE_MEDIUM round-trip
-  std::vector<Value> values;
-  for (int i = 0; i < 100; ++i) values.push_back(Value::WIN);
-  for (int i = 0; i < 50; ++i) values.push_back(Value::LOSS);
-  for (int i = 0; i < 100; ++i) values.push_back(Value::DRAW);
-  for (int i = 0; i < 50; ++i) values.push_back(Value::WIN);
-
-  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::HUFFMAN_RLE_MEDIUM);
-  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::HUFFMAN_RLE_MEDIUM);
-
-  ASSERT_EQ(decompressed.size(), values.size());
-  for (std::size_t i = 0; i < values.size(); ++i) {
-    ASSERT(decompressed[i] == values[i]);
-  }
-}
-
-TEST(huffman_variable_roundtrip) {
-  // Test HUFFMAN_RLE_VARIABLE round-trip
-  std::vector<Value> values;
-  for (int i = 0; i < 100; ++i) values.push_back(Value::WIN);
-  for (int i = 0; i < 50; ++i) values.push_back(Value::LOSS);
-  for (int i = 0; i < 100; ++i) values.push_back(Value::DRAW);
-
-  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::HUFFMAN_RLE_VARIABLE);
-  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::HUFFMAN_RLE_VARIABLE);
-
-  ASSERT_EQ(decompressed.size(), values.size());
-  for (std::size_t i = 0; i < values.size(); ++i) {
-    ASSERT(decompressed[i] == values[i]);
-  }
-}
-
-TEST(huffman_two_values_roundtrip) {
-  // Test with only 2 distinct values (no prediction bit needed)
-  std::vector<Value> values;
-  for (int i = 0; i < 200; ++i) values.push_back(Value::WIN);
-  for (int i = 0; i < 100; ++i) values.push_back(Value::LOSS);
-  for (int i = 0; i < 200; ++i) values.push_back(Value::WIN);
-
-  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::HUFFMAN_RLE_MEDIUM);
-  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::HUFFMAN_RLE_MEDIUM);
-
-  ASSERT_EQ(decompressed.size(), values.size());
-  for (std::size_t i = 0; i < values.size(); ++i) {
-    ASSERT(decompressed[i] == values[i]);
-  }
-}
-
-TEST(huffman_single_value_block) {
-  // Test with all same value (single run)
-  std::vector<Value> values(1000, Value::DRAW);
-
-  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::HUFFMAN_RLE_MEDIUM);
-  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::HUFFMAN_RLE_MEDIUM);
-
-  ASSERT_EQ(decompressed.size(), values.size());
-  for (std::size_t i = 0; i < values.size(); ++i) {
-    ASSERT(decompressed[i] == Value::DRAW);
-  }
-
-  // Single-value block should be very small (2 bytes)
-  ASSERT_EQ(compressed.size(), 2u);
-}
-
-TEST(huffman_alternating) {
-  // Test with alternating values (many short runs)
-  std::vector<Value> values;
-  for (int i = 0; i < 50; ++i) {
-    values.push_back(i % 2 == 0 ? Value::WIN : Value::LOSS);
-  }
-
-  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::HUFFMAN_RLE_MEDIUM);
-  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::HUFFMAN_RLE_MEDIUM);
-
-  ASSERT_EQ(decompressed.size(), values.size());
-  for (std::size_t i = 0; i < values.size(); ++i) {
-    ASSERT(decompressed[i] == values[i]);
-  }
-}
 
 TEST(huffman_best_vs_rle) {
   // Test that compress_block_best chooses between Huffman and RLE appropriately
@@ -1697,12 +1619,7 @@ int main() {
   RUN_TEST(rle_binary_search_lookup);
   RUN_TEST(rle_best_selection);
 
-  std::cout << "\nRunning Huffman RLE compression tests (Stage 4):\n";
-  RUN_TEST(huffman_short_roundtrip);
-  RUN_TEST(huffman_variable_roundtrip);
-  RUN_TEST(huffman_two_values_roundtrip);
-  RUN_TEST(huffman_single_value_block);
-  RUN_TEST(huffman_alternating);
+  std::cout << "\nRunning block compression selection tests:\n";
   RUN_TEST(huffman_best_vs_rle);
 
   std::cout << "\nRunning 3-value Huffman RLE tests (Method 9):\n";
