@@ -19,6 +19,11 @@ std::vector<std::uint8_t> compress_rle_huffman_2val(const Value* values, std::si
 std::vector<Value> decompress_rle_huffman_2val(const std::uint8_t* data, std::size_t data_size,
                                                 std::size_t num_values);
 
+// Forward declarations for optimized 3-value RLE with prediction
+std::vector<std::uint8_t> compress_rle_huffman_3val(const Value* values, std::size_t count);
+std::vector<Value> decompress_rle_huffman_3val(const std::uint8_t* data, std::size_t data_size,
+                                                std::size_t num_values);
+
 // ============================================================================
 // Don't-Care Position Detection (Stage 1)
 // ============================================================================
@@ -377,116 +382,6 @@ std::vector<Value> decompress_raw_2bit(const std::uint8_t* data, std::size_t num
 }
 
 // ============================================================================
-// Method 1: TERNARY_BASE3
-// Base-3 encoding, 5 values per byte (3^5 = 243 < 256)
-// Only works for blocks with at most 3 distinct values.
-// ============================================================================
-
-// Check if a block can be ternary-encoded (has <= 3 distinct values)
-bool can_use_ternary(const Value* values, std::size_t count) {
-  bool seen[4] = {false, false, false, false};
-  int num_distinct = 0;
-
-  for (std::size_t i = 0; i < count; ++i) {
-    std::uint8_t v = value_to_int(values[i]);
-    if (!seen[v]) {
-      seen[v] = true;
-      ++num_distinct;
-      if (num_distinct > 3) return false;
-    }
-  }
-
-  return true;
-}
-
-// Compress using base-3 encoding.
-// First byte stores the mapping: which 3 values are present (encoded as bitmask).
-// Remaining bytes store 5 ternary values each.
-std::vector<std::uint8_t> compress_ternary_base3(const Value* values, std::size_t count) {
-  // First, determine which values are present and create mapping
-  bool present[4] = {false, false, false, false};
-  for (std::size_t i = 0; i < count; ++i) {
-    present[value_to_int(values[i])] = true;
-  }
-
-  // Create mapping: value_to_int(v) -> ternary index (0, 1, or 2)
-  std::uint8_t mapping[4];
-  std::uint8_t reverse_mapping[3];  // ternary index -> original value
-  std::uint8_t next_idx = 0;
-
-  for (int v = 0; v < 4 && next_idx < 3; ++v) {
-    if (present[v]) {
-      mapping[v] = next_idx;
-      reverse_mapping[next_idx] = static_cast<std::uint8_t>(v);
-      ++next_idx;
-    } else {
-      mapping[v] = 0;  // Map unused values to 0
-    }
-  }
-
-  // Fill remaining slots in reverse mapping (shouldn't matter, but be safe)
-  while (next_idx < 3) {
-    reverse_mapping[next_idx++] = 0;
-  }
-
-  // Calculate output size: 1 header byte + ceil(count/5) data bytes
-  std::size_t num_data_bytes = (count + 4) / 5;
-  std::vector<std::uint8_t> result;
-  result.reserve(1 + num_data_bytes);
-
-  // Header byte: encodes the reverse mapping
-  // Bits 0-1: reverse_mapping[0]
-  // Bits 2-3: reverse_mapping[1]
-  // Bits 4-5: reverse_mapping[2]
-  std::uint8_t header = reverse_mapping[0] |
-                        (reverse_mapping[1] << 2) |
-                        (reverse_mapping[2] << 4);
-  result.push_back(header);
-
-  // Encode 5 values per byte in base-3
-  for (std::size_t i = 0; i < count; i += 5) {
-    std::uint8_t packed = 0;
-    std::uint8_t multiplier = 1;
-
-    for (std::size_t j = 0; j < 5 && i + j < count; ++j) {
-      std::uint8_t ternary_val = mapping[value_to_int(values[i + j])];
-      packed += ternary_val * multiplier;
-      multiplier *= 3;
-    }
-
-    result.push_back(packed);
-  }
-
-  return result;
-}
-
-std::vector<Value> decompress_ternary_base3(const std::uint8_t* data, std::size_t num_values) {
-  if (num_values == 0) return {};
-
-  // Read header to get reverse mapping
-  std::uint8_t header = data[0];
-  std::uint8_t reverse_mapping[3];
-  reverse_mapping[0] = header & 0x3;
-  reverse_mapping[1] = (header >> 2) & 0x3;
-  reverse_mapping[2] = (header >> 4) & 0x3;
-
-  std::vector<Value> result(num_values);
-  const std::uint8_t* packed = data + 1;
-
-  for (std::size_t i = 0; i < num_values; i += 5) {
-    std::uint8_t byte = packed[i / 5];
-
-    for (std::size_t j = 0; j < 5 && i + j < num_values; ++j) {
-      std::uint8_t ternary_val = byte % 3;
-      byte /= 3;
-      result[i + j] = int_to_value(reverse_mapping[ternary_val]);
-    }
-  }
-
-  return result;
-}
-
-// ============================================================================
 // Method 3: RLE_BINARY_SEARCH
 // Run-length encoding with 16-bit records: 14-bit index + 2-bit value.
 // Each record means "from this index until the next record, value is X".
@@ -720,27 +615,21 @@ std::vector<std::uint8_t> compress_block(
     case CompressionMethod::RAW_2BIT:
       return compress_raw_2bit(values, count);
 
-    case CompressionMethod::TERNARY_BASE3:
-      if (can_use_ternary(values, count)) {
-        return compress_ternary_base3(values, count);
-      }
-      // Fall back to raw 2-bit if ternary not possible
-      return compress_raw_2bit(values, count);
-
     case CompressionMethod::RLE_BINARY_SEARCH:
       return compress_rle_binary_search(values, count);
 
     case CompressionMethod::DEFAULT_EXCEPTIONS:
       return compress_default_exceptions(values, count);
 
-    case CompressionMethod::HUFFMAN_RLE_SHORT:
     case CompressionMethod::HUFFMAN_RLE_MEDIUM:
-    case CompressionMethod::HUFFMAN_RLE_LONG:
     case CompressionMethod::HUFFMAN_RLE_VARIABLE:
       return compress_huffman_rle(values, count, method);
 
     case CompressionMethod::RLE_HUFFMAN_2VAL:
       return compress_rle_huffman_2val(values, count);
+
+    case CompressionMethod::RLE_HUFFMAN_3VAL:
+      return compress_rle_huffman_3val(values, count);
 
     default:
       return compress_raw_2bit(values, count);
@@ -757,23 +646,21 @@ std::vector<Value> decompress_block(
     case CompressionMethod::RAW_2BIT:
       return decompress_raw_2bit(data, num_values);
 
-    case CompressionMethod::TERNARY_BASE3:
-      return decompress_ternary_base3(data, num_values);
-
     case CompressionMethod::RLE_BINARY_SEARCH:
       return decompress_rle_binary_search(data, data_size, num_values);
 
     case CompressionMethod::DEFAULT_EXCEPTIONS:
       return decompress_default_exceptions(data, data_size, num_values);
 
-    case CompressionMethod::HUFFMAN_RLE_SHORT:
     case CompressionMethod::HUFFMAN_RLE_MEDIUM:
-    case CompressionMethod::HUFFMAN_RLE_LONG:
     case CompressionMethod::HUFFMAN_RLE_VARIABLE:
       return decompress_huffman_rle(data, data_size, num_values, method);
 
     case CompressionMethod::RLE_HUFFMAN_2VAL:
       return decompress_rle_huffman_2val(data, data_size, num_values);
+
+    case CompressionMethod::RLE_HUFFMAN_3VAL:
+      return decompress_rle_huffman_3val(data, data_size, num_values);
 
     default:
       return decompress_raw_2bit(data, num_values);
@@ -788,15 +675,6 @@ std::pair<CompressionMethod, std::vector<std::uint8_t>> compress_block_best(
   auto raw = compress_raw_2bit(values, count);
   CompressionMethod best_method = CompressionMethod::RAW_2BIT;
   std::vector<std::uint8_t> best_data = std::move(raw);
-
-  // Try Method 1: TERNARY_BASE3 (if applicable)
-  if (can_use_ternary(values, count)) {
-    auto ternary = compress_ternary_base3(values, count);
-    if (ternary.size() < best_data.size()) {
-      best_method = CompressionMethod::TERNARY_BASE3;
-      best_data = std::move(ternary);
-    }
-  }
 
   // Try Method 3: RLE_BINARY_SEARCH (always available)
   auto rle = compress_rle_binary_search(values, count);
@@ -815,7 +693,7 @@ std::pair<CompressionMethod, std::vector<std::uint8_t>> compress_block_best(
   // Count distinct values to determine which methods to try
   bool seen[4] = {false, false, false, false};
   int num_distinct = 0;
-  for (std::size_t i = 0; i < count && num_distinct <= 2; ++i) {
+  for (std::size_t i = 0; i < count && num_distinct <= 3; ++i) {
     std::uint8_t v = value_to_int(values[i]);
     if (!seen[v]) {
       seen[v] = true;
@@ -832,12 +710,19 @@ std::pair<CompressionMethod, std::vector<std::uint8_t>> compress_block_best(
     }
   }
 
-  // Try Huffman RLE methods (4-7) for blocks with 3+ values
+  // Try Method 9: RLE_HUFFMAN_3VAL (optimized for 3-value blocks with prediction)
+  if (num_distinct == 3) {
+    auto huffman_3val = compress_rle_huffman_3val(values, count);
+    if (huffman_3val.size() < best_data.size()) {
+      best_method = CompressionMethod::RLE_HUFFMAN_3VAL;
+      best_data = std::move(huffman_3val);
+    }
+  }
+
+  // Try Huffman RLE methods for blocks with 3+ values
   if (num_distinct >= 3) {
     constexpr CompressionMethod huffman_methods[] = {
-      CompressionMethod::HUFFMAN_RLE_SHORT,
       CompressionMethod::HUFFMAN_RLE_MEDIUM,
-      CompressionMethod::HUFFMAN_RLE_LONG,
       CompressionMethod::HUFFMAN_RLE_VARIABLE,
     };
 
@@ -857,9 +742,6 @@ std::size_t expected_compressed_size(std::size_t num_values, CompressionMethod m
   switch (method) {
     case CompressionMethod::RAW_2BIT:
       return (num_values + 3) / 4;
-
-    case CompressionMethod::TERNARY_BASE3:
-      return 1 + (num_values + 4) / 5;  // 1 header byte + data
 
     default:
       return 0;  // Cannot determine without compressing
@@ -1034,28 +916,6 @@ Value lookup_compressed(
     return int_to_value(v);
   }
 
-  if (method == CompressionMethod::TERNARY_BASE3) {
-    const std::uint8_t* data = block_ptr + 3;
-    std::uint8_t header = data[0];
-    std::uint8_t reverse_mapping[3];
-    reverse_mapping[0] = header & 0x3;
-    reverse_mapping[1] = (header >> 2) & 0x3;
-    reverse_mapping[2] = (header >> 4) & 0x3;
-
-    // Find the byte containing this value
-    std::size_t group_idx = idx_in_block / 5;
-    std::size_t pos_in_group = idx_in_block % 5;
-    std::uint8_t byte = data[1 + group_idx];
-
-    // Extract the ternary value at the given position
-    for (std::size_t i = 0; i < pos_in_group; ++i) {
-      byte /= 3;
-    }
-    std::uint8_t ternary_val = byte % 3;
-
-    return int_to_value(reverse_mapping[ternary_val]);
-  }
-
   if (method == CompressionMethod::RLE_BINARY_SEARCH) {
     std::uint16_t compressed_size = block_ptr[1] | (block_ptr[2] << 8);
     const std::uint8_t* data = block_ptr + 3;
@@ -1069,9 +929,7 @@ Value lookup_compressed(
   }
 
   // For Huffman methods, use cache (sequential-access only)
-  if (method == CompressionMethod::HUFFMAN_RLE_SHORT ||
-      method == CompressionMethod::HUFFMAN_RLE_MEDIUM ||
-      method == CompressionMethod::HUFFMAN_RLE_LONG ||
+  if (method == CompressionMethod::HUFFMAN_RLE_MEDIUM ||
       method == CompressionMethod::HUFFMAN_RLE_VARIABLE ||
       method == CompressionMethod::RLE_HUFFMAN_2VAL) {
     if (cache) {
@@ -1482,118 +1340,6 @@ struct HuffmanCode {
 //   Length 129-256: 1111111110 + 7 bits (17 bits, split across)
 //   Length 257-16384: 11111111110 + 14 bits (25 bits, but we cap)
 
-// For SHORT method (optimized for short runs, ~10 avg):
-// Favor very short runs more heavily
-constexpr int HUFFMAN_SHORT_DIRECT_MAX = 8;
-
-// For MEDIUM method (optimized for ~50 avg runs):
-// More balanced distribution
-constexpr int HUFFMAN_MEDIUM_DIRECT_MAX = 16;
-
-// For LONG method (optimized for ~200 avg runs):
-// Favor longer runs
-constexpr int HUFFMAN_LONG_DIRECT_MAX = 32;
-
-// Encode a run length using the SHORT Huffman table.
-// Returns (code, num_bits).
-std::pair<std::uint32_t, int> encode_run_length_short(std::size_t length) {
-  if (length == 0) length = 1;  // Minimum run length is 1
-
-  if (length == 1) return {0b0, 1};
-  if (length == 2) return {0b10, 2};
-  if (length == 3) return {0b110, 3};
-  if (length == 4) return {0b1110, 4};
-  if (length <= 8) {
-    // 11110 + 2 bits for 5-8
-    std::uint32_t code = (0b11110 << 2) | (length - 5);
-    return {code, 7};
-  }
-  if (length <= 16) {
-    // 111110 + 3 bits for 9-16
-    std::uint32_t code = (0b111110 << 3) | (length - 9);
-    return {code, 9};
-  }
-  if (length <= 32) {
-    // 1111110 + 4 bits for 17-32
-    std::uint32_t code = (0b1111110 << 4) | (length - 17);
-    return {code, 11};
-  }
-  if (length <= 64) {
-    // 11111110 + 5 bits for 33-64
-    std::uint32_t code = (0b11111110u << 5) | (length - 33);
-    return {code, 13};
-  }
-  if (length <= 128) {
-    // 111111110 + 6 bits for 65-128
-    std::uint32_t code = (0b111111110u << 6) | (length - 65);
-    return {code, 15};
-  }
-  if (length <= 256) {
-    // 1111111110 + 7 bits for 129-256
-    std::uint32_t code = (0b1111111110u << 7) | (length - 129);
-    return {code, 17};
-  }
-  if (length <= 512) {
-    // 11111111110 + 8 bits for 257-512
-    std::uint32_t code = (0b11111111110u << 8) | (length - 257);
-    return {code, 19};
-  }
-  if (length <= 1024) {
-    // 111111111110 + 9 bits for 513-1024
-    std::uint32_t code = (0b111111111110u << 9) | (length - 513);
-    return {code, 21};
-  }
-  if (length <= 2048) {
-    // 1111111111110 + 10 bits for 1025-2048
-    std::uint32_t code = (0b1111111111110u << 10) | (length - 1025);
-    return {code, 23};
-  }
-  if (length <= 4096) {
-    // 11111111111110 + 11 bits for 2049-4096
-    std::uint32_t code = (0b11111111111110u << 11) | (length - 2049);
-    return {code, 25};
-  }
-  if (length <= 8192) {
-    // 111111111111110 + 12 bits for 4097-8192
-    std::uint32_t code = (0b111111111111110u << 12) | (length - 4097);
-    return {code, 27};
-  }
-  // 1111111111111110 + 14 bits for 8193-16384+
-  length = std::min(length, std::size_t(16384 + 8192));
-  std::uint32_t code = (0b1111111111111110u << 14) | (length - 8193);
-  return {code, 30};
-}
-
-// Decode a run length using the SHORT Huffman table.
-std::size_t decode_run_length_short(BitReader& reader) {
-  // Read prefix bits until we find a 0
-  int prefix = 0;
-  while (reader.has_bits(1) && reader.read(1) == 1) {
-    prefix++;
-    if (prefix >= 16) break;  // Cap at longest prefix
-  }
-
-  // Based on prefix, decode the run length
-  switch (prefix) {
-    case 0: return 1;
-    case 1: return 2;
-    case 2: return 3;
-    case 3: return 4;
-    case 4: return 5 + reader.read(2);   // 5-8
-    case 5: return 9 + reader.read(3);   // 9-16
-    case 6: return 17 + reader.read(4);  // 17-32
-    case 7: return 33 + reader.read(5);  // 33-64
-    case 8: return 65 + reader.read(6);  // 65-128
-    case 9: return 129 + reader.read(7); // 129-256
-    case 10: return 257 + reader.read(8); // 257-512
-    case 11: return 513 + reader.read(9); // 513-1024
-    case 12: return 1025 + reader.read(10); // 1025-2048
-    case 13: return 2049 + reader.read(11); // 2049-4096
-    case 14: return 4097 + reader.read(12); // 4097-8192
-    default: return 8193 + reader.read(14); // 8193+
-  }
-}
-
 // MEDIUM method - slightly different bias for medium-length runs
 std::pair<std::uint32_t, int> encode_run_length_medium(std::size_t length) {
   if (length == 0) length = 1;
@@ -1706,110 +1452,6 @@ std::size_t decode_run_length_medium(BitReader& reader) {
   return 8193 + reader.read(14);    // 8193+
 }
 
-// LONG method - optimized for long runs
-// Encoding: favor longer runs with shorter codes for common lengths
-//   1-4:     2 bits each (00=1, 01=2, 10=3, 11=4)
-//   5-12:    100 + 3 bits (8 values)
-//   13-28:   101 + 4 bits (16 values)
-//   29-60:   1100 + 5 bits (32 values)
-//   61-124:  1101 + 6 bits (64 values)
-//   125-252: 1110 + 7 bits (128 values)
-//   253-508: 1111 + 8 bits (256 values, but cap at 508)
-//   509+:    11110 + 14 bits
-[[maybe_unused]]
-std::pair<std::uint32_t, int> encode_run_length_long(std::size_t length) {
-  if (length == 0) length = 1;
-
-  if (length <= 4) {
-    return {static_cast<std::uint32_t>(length - 1), 2};
-  }
-  if (length <= 12) {
-    std::uint32_t code = (0b100 << 3) | (length - 5);
-    return {code, 6};
-  }
-  if (length <= 28) {
-    std::uint32_t code = (0b101 << 4) | (length - 13);
-    return {code, 7};
-  }
-  if (length <= 60) {
-    std::uint32_t code = (0b1100 << 5) | (length - 29);
-    return {code, 9};
-  }
-  if (length <= 124) {
-    std::uint32_t code = (0b1101 << 6) | (length - 61);
-    return {code, 10};
-  }
-  if (length <= 252) {
-    std::uint32_t code = (0b1110 << 7) | (length - 125);
-    return {code, 11};
-  }
-  if (length <= 508) {
-    std::uint32_t code = (0b11110 << 8) | (length - 253);
-    return {code, 13};
-  }
-  if (length <= 1020) {
-    std::uint32_t code = (0b111110 << 9) | (length - 509);
-    return {code, 15};
-  }
-  if (length <= 2044) {
-    std::uint32_t code = (0b1111110 << 10) | (length - 1021);
-    return {code, 17};
-  }
-  if (length <= 4092) {
-    std::uint32_t code = (0b11111110u << 11) | (length - 2045);
-    return {code, 19};
-  }
-  if (length <= 8188) {
-    std::uint32_t code = (0b111111110u << 12) | (length - 4093);
-    return {code, 21};
-  }
-  // Cap at 16384
-  length = std::min(length, std::size_t(16384));
-  std::uint32_t code = (0b1111111110u << 13) | (length - 8189);
-  return {code, 23};
-}
-
-[[maybe_unused]]
-std::size_t decode_run_length_long(BitReader& reader) {
-  // Read first 2 bits
-  std::uint32_t first2 = reader.read(2);
-  if (first2 <= 3) {
-    return first2 + 1;  // 1-4
-  }
-
-  // If first2 was 00, 01, 10, 11 we returned above.
-  // But wait - first2 can only be 0-3, so all short lengths are handled.
-  // For longer codes, first2 would be part of a prefix like 10x or 11xx.
-
-  // The issue: we need to check bit patterns properly.
-  // Let's re-read. First 2 bits tell us:
-  //   00 = 1, 01 = 2, 10 = 3, 11 = 4... but that's wrong!
-  //   We want: 00=1, 01=2, 10=3, 11=4 only IF the next bit would start a new code.
-
-  // Actually my encoding is different. Let me trace through:
-  //   Length 1: code = 00, 2 bits
-  //   Length 5: code = 100 << 3 | 0 = 0b100000, 6 bits
-
-  // So if first2 = 00 (length 1), we're done.
-  // If first2 = 01 (length 2), we're done.
-  // If first2 = 10 (length 3 OR start of 100/101), need to check next bit.
-  // If first2 = 11 (length 4 OR start of 110/111), need to check next bit.
-
-  // My encoding is inconsistent. Let me fix it to be prefix-free:
-  //   1:   0          (1 bit)
-  //   2:   10         (2 bits)
-  //   3:   110        (3 bits)
-  //   4:   1110       (4 bits)
-  //   5-12: 11110 + 3 bits (8 bits)
-  //   etc.
-
-  // For now, return a simple fallback. The SHORT and VARIABLE methods work correctly.
-  // LONG method needs more careful design, but let's test the others first.
-
-  // Simple fallback: just use SHORT decoding
-  return 5;  // Placeholder
-}
-
 // VARIABLE method - geometric distribution (good for variable-length runs)
 std::pair<std::uint32_t, int> encode_run_length_variable(std::size_t length) {
   // Simple Elias gamma-like coding
@@ -1866,13 +1508,8 @@ using RunLengthDecoder = std::size_t(*)(BitReader&);
 
 std::pair<RunLengthEncoder, RunLengthDecoder> get_huffman_codec(CompressionMethod method) {
   switch (method) {
-    case CompressionMethod::HUFFMAN_RLE_SHORT:
-      return {encode_run_length_short, decode_run_length_short};
     case CompressionMethod::HUFFMAN_RLE_MEDIUM:
       return {encode_run_length_medium, decode_run_length_medium};
-    case CompressionMethod::HUFFMAN_RLE_LONG:
-      // LONG uses SHORT codec for now (TODO: optimize for long runs)
-      return {encode_run_length_short, decode_run_length_short};
     case CompressionMethod::HUFFMAN_RLE_VARIABLE:
     default:
       return {encode_run_length_variable, decode_run_length_variable};
@@ -2298,6 +1935,491 @@ std::vector<Value> decompress_rle_huffman_2val(const std::uint8_t* data, std::si
 
     // Alternate value for next run
     current_value = (current_value == val_0) ? val_1 : val_0;
+  }
+
+  // Pad if needed
+  while (result.size() < num_values) {
+    result.push_back(Value::UNKNOWN);
+  }
+
+  return result;
+}
+
+// ============================================================================
+// Optimized Huffman RLE for 3-Value Blocks with Prediction (Method 9)
+// ============================================================================
+//
+// Format (optimized for 3-value blocks with prediction scheme):
+//   Byte 0:     val_0 (bits 0-1) | val_1 (bits 2-3) | val_2 (bits 4-5)
+//   Bytes 1-2:  run_count (uint16_t LE)
+//   Bytes 3-4:  bit_stream_bytes (uint16_t LE)
+//   Bytes 5+:   Huffman-encoded symbols
+//
+// Prediction scheme:
+//   - Run 0 and 1: values from header (treated as TRUE predictions)
+//   - Run k (k >= 2): predicted value = run[k-2].value
+//     - TRUE: prediction correct (96% of cases)
+//     - FALSE: prediction wrong (4% of cases)
+//
+// Scheme B: Combined (prediction, length_bucket) Huffman encoding
+// Based on 6-men EGTB statistics, optimized for ~3.24 bits/symbol
+//
+// TRUE symbols (sorted by frequency):
+//   T1:        0           (1 bit)   36.61%
+//   T2:        100         (3 bits)  16.38%
+//   T3:        1010        (4 bits)   9.94%
+//   T5-8:      1011 + 2b   (6 bits)   9.21%
+//   T9-16:     11000 + 3b  (8 bits)   6.53%
+//   T17-32:    11001 + 4b  (9 bits)   5.79%
+//   T4:        11010       (5 bits)   4.65%
+//   T33-64:    110110 + 5b (11 bits)  3.24%
+//   T65-128:   1110000 + 6b (13 bits) 1.93%
+//   T129-256:  11100010 + 7b (15 bits) 0.94%
+//   T257-512:  111001000 + 8b (17 bits) 0.52%
+//   T513-1024: 1110010100 + 9b (19 bits) 0.20%
+//   T1025-2048: 111001100001 + 10b (22 bits)
+//   T2049+:    111001100010 + 14b (26 bits)
+//
+// FALSE symbols:
+//   F1:        110111      (6 bits)   2.50%
+//   F2:        11100011    (8 bits)   0.57%
+//   F3:        111001001   (9 bits)   0.26%
+//   F4:        1110010110  (10 bits)  0.12%
+//   F5-8:      1110010101 + 2b (12 bits) 0.20%
+//   F9-16:     11100101110 + 3b (14 bits) 0.13%
+//   F17-32:    11100101111 + 4b (15 bits) 0.13%
+//   F33-64:    111001100000 + 5b (17 bits) 0.05%
+//   F65+:      1110011000110 + 14b (27 bits)
+
+// Encode a (TRUE, length) symbol using Scheme B
+static void encode_true_symbol(BitWriter& writer, std::size_t len) {
+  if (len == 1) {
+    writer.write(0b0, 1);
+  } else if (len == 2) {
+    writer.write(0b100, 3);
+  } else if (len == 3) {
+    writer.write(0b1010, 4);
+  } else if (len == 4) {
+    writer.write(0b11010, 5);
+  } else if (len <= 8) {
+    writer.write(0b1011, 4);
+    writer.write(static_cast<std::uint32_t>(len - 5), 2);
+  } else if (len <= 16) {
+    writer.write(0b11000, 5);
+    writer.write(static_cast<std::uint32_t>(len - 9), 3);
+  } else if (len <= 32) {
+    writer.write(0b11001, 5);
+    writer.write(static_cast<std::uint32_t>(len - 17), 4);
+  } else if (len <= 64) {
+    writer.write(0b110110, 6);
+    writer.write(static_cast<std::uint32_t>(len - 33), 5);
+  } else if (len <= 128) {
+    writer.write(0b1110000, 7);
+    writer.write(static_cast<std::uint32_t>(len - 65), 6);
+  } else if (len <= 256) {
+    writer.write(0b11100010, 8);
+    writer.write(static_cast<std::uint32_t>(len - 129), 7);
+  } else if (len <= 512) {
+    writer.write(0b111001000, 9);
+    writer.write(static_cast<std::uint32_t>(len - 257), 8);
+  } else if (len <= 1024) {
+    writer.write(0b1110010100, 10);
+    writer.write(static_cast<std::uint32_t>(len - 513), 9);
+  } else if (len <= 2048) {
+    writer.write(0b111001100001, 12);
+    writer.write(static_cast<std::uint32_t>(len - 1025), 10);
+  } else {
+    // 2049+
+    len = std::min(len, std::size_t(16384));
+    writer.write(0b111001100010, 12);
+    writer.write(static_cast<std::uint32_t>(len - 2049), 14);
+  }
+}
+
+// Encode a (FALSE, length, which_value) symbol using Scheme B
+// which_value: 0 = val_k_minus_1, 1 = third value
+static void encode_false_symbol(BitWriter& writer, std::size_t len, int which_value) {
+  if (len == 1) {
+    writer.write(0b110111, 6);
+  } else if (len == 2) {
+    writer.write(0b11100011, 8);
+  } else if (len == 3) {
+    writer.write(0b111001001, 9);
+  } else if (len == 4) {
+    writer.write(0b1110010110, 10);
+  } else if (len <= 8) {
+    writer.write(0b1110010101, 10);
+    writer.write(static_cast<std::uint32_t>(len - 5), 2);
+  } else if (len <= 16) {
+    writer.write(0b11100101110, 11);
+    writer.write(static_cast<std::uint32_t>(len - 9), 3);
+  } else if (len <= 32) {
+    writer.write(0b11100101111, 11);
+    writer.write(static_cast<std::uint32_t>(len - 17), 4);
+  } else if (len <= 64) {
+    writer.write(0b111001100000, 12);
+    writer.write(static_cast<std::uint32_t>(len - 33), 5);
+  } else {
+    // 65+
+    len = std::min(len, std::size_t(16384));
+    writer.write(0b1110011000110, 13);
+    writer.write(static_cast<std::uint32_t>(len - 65), 14);
+  }
+  // Add 1-bit selector for which FALSE value
+  writer.write(static_cast<std::uint32_t>(which_value), 1);
+}
+
+// Decode symbol returns: (is_true, length, which_false)
+// which_false is only valid when is_true == false: 0 = val_k_minus_1, 1 = third
+static std::tuple<bool, std::size_t, int> decode_symbol(BitReader& reader) {
+  // Helper to read which_false bit for FALSE symbols
+  auto read_false = [&reader](std::size_t len) -> std::tuple<bool, std::size_t, int> {
+    int which = reader.has_bits(1) ? static_cast<int>(reader.read(1)) : 0;
+    return {false, len, which};
+  };
+
+  // Prefix codes (from Scheme B design):
+  // 0               = T1
+  // 100             = T2
+  // 1010            = T3
+  // 1011 + 2b       = T5-8
+  // 11000 + 3b      = T9-16
+  // 11001 + 4b      = T17-32
+  // 11010           = T4
+  // 110110 + 5b     = T33-64
+  // 110111 + which  = F1
+  // 1110000 + 6b    = T65-128
+  // 11100010 + 7b   = T129-256
+  // 11100011 + which = F2
+  // 111001000 + 8b  = T257-512
+  // 111001001 + which = F3
+  // 1110010100 + 9b = T513-1024
+  // 1110010101 + 2b + which = F5-8
+  // 1110010110 + which = F4
+  // 11100101110 + 3b + which = F9-16
+  // 11100101111 + 4b + which = F17-32
+  // 111001100000 + 5b + which = F33-64
+  // 111001100001 + 10b = T1025-2048
+  // 111001100010 + 14b = T2049+
+  // 1110011000110 + 14b + which = F65+
+
+  if (!reader.has_bits(1)) return {true, 1, 0};
+
+  // Bit 0
+  if (reader.read(1) == 0) return {true, 1, 0};  // T1
+
+  // Bit 1-2: 1xx
+  if (!reader.has_bits(2)) return {true, 1, 0};
+  std::uint32_t b12 = reader.read(2);
+
+  if (b12 == 0b00) return {true, 2, 0};  // 100 = T2
+
+  if (b12 == 0b01) {
+    // 101x
+    if (!reader.has_bits(1)) return {true, 1, 0};
+    if (reader.read(1) == 0) return {true, 3, 0};  // 1010 = T3
+    // 1011 + 2b = T5-8
+    return {true, 5 + reader.read(2), 0};
+  }
+
+  if (b12 == 0b10) {
+    // 110xx
+    if (!reader.has_bits(2)) return {true, 1, 0};
+    std::uint32_t b34 = reader.read(2);
+
+    if (b34 == 0b00) return {true, 9 + reader.read(3), 0};   // 11000 + 3b = T9-16
+    if (b34 == 0b01) return {true, 17 + reader.read(4), 0};  // 11001 + 4b = T17-32
+    if (b34 == 0b10) return {true, 4, 0};                     // 11010 = T4
+
+    // 11011x
+    if (!reader.has_bits(1)) return {true, 1, 0};
+    if (reader.read(1) == 0) return {true, 33 + reader.read(5), 0};  // 110110 + 5b = T33-64
+    return read_false(1);  // 110111 = F1
+  }
+
+  // b12 == 0b11: 111xxxx
+  if (!reader.has_bits(4)) return {true, 1, 0};
+  std::uint32_t b3456 = reader.read(4);
+
+  if (b3456 == 0b0000) return {true, 65 + reader.read(6), 0};  // 1110000 + 6b = T65-128
+
+  if (b3456 == 0b0001) {
+    // 1110001x
+    if (!reader.has_bits(1)) return {true, 1, 0};
+    if (reader.read(1) == 0) return {true, 129 + reader.read(7), 0};  // 11100010 + 7b = T129-256
+    return read_false(2);  // 11100011 = F2
+  }
+
+  if (b3456 == 0b0010) {
+    // 1110010x...
+    // Tree structure:
+    // bit7=0: 1110010|0x → bit8=0: T257-512, bit8=1: F3
+    // bit7=1: 1110010|1xx → bits8-9: 00=T513-1024, 01=F5-8, 10=F4, 11=F9-16/F17-32
+    if (!reader.has_bits(1)) return {true, 1, 0};
+    std::uint32_t bit7 = reader.read(1);
+
+    if (bit7 == 0) {
+      // 11100100x
+      if (!reader.has_bits(1)) return {true, 1, 0};
+      if (reader.read(1) == 0) return {true, 257 + reader.read(8), 0};  // 111001000 + 8b = T257-512
+      return read_false(3);                                              // 111001001 = F3
+    }
+
+    // bit7 == 1: 11100101xx
+    if (!reader.has_bits(2)) return {true, 1, 0};
+    std::uint32_t b89 = reader.read(2);
+
+    if (b89 == 0b00) return {true, 513 + reader.read(9), 0};  // 1110010100 + 9b = T513-1024
+    if (b89 == 0b01) return read_false(5 + reader.read(2));   // 1110010101 + 2b = F5-8
+    if (b89 == 0b10) return read_false(4);                     // 1110010110 = F4
+
+    // b89 == 0b11: 1110010111x
+    if (!reader.has_bits(1)) return {true, 1, 0};
+    if (reader.read(1) == 0) return read_false(9 + reader.read(3));   // 11100101110 + 3b = F9-16
+    return read_false(17 + reader.read(4));                            // 11100101111 + 4b = F17-32
+  }
+
+  if (b3456 == 0b0011) {
+    // 1110011xxxxx
+    if (!reader.has_bits(5)) return {true, 1, 0};
+    std::uint32_t b789ab = reader.read(5);
+
+    if (b789ab == 0b00000) return read_false(33 + reader.read(5));      // 111001100000 + 5b = F33-64
+    if (b789ab == 0b00001) return {true, 1025 + reader.read(10), 0};    // 111001100001 + 10b = T1025-2048
+    if (b789ab == 0b00010) return {true, 2049 + reader.read(14), 0};    // 111001100010 + 14b = T2049+
+
+    // 1110011000110 + 14b = F65+  (b789ab == 0b00011, then read 1 more bit which must be 0)
+    if (b789ab == 0b00011) {
+      if (!reader.has_bits(1)) return {true, 1, 0};
+      reader.read(1);  // Read and discard the trailing 0
+      return read_false(65 + reader.read(14));
+    }
+  }
+
+  // Fallback (shouldn't reach here in valid data)
+  return {true, 1, 0};
+}
+
+std::vector<std::uint8_t> compress_rle_huffman_3val(const Value* values, std::size_t count) {
+  if (count == 0) return {};
+
+  // Extract runs with values
+  struct Run {
+    std::uint8_t value;
+    std::size_t length;
+  };
+  std::vector<Run> runs;
+  runs.reserve(count / 10);
+
+  // Track distinct values and build runs
+  std::uint8_t val_0 = value_to_int(values[0]);
+  std::uint8_t val_1 = val_0;  // Will be set when we find second value
+  int num_distinct = 1;
+
+  std::size_t current_length = 1;
+
+  for (std::size_t i = 1; i < count; ++i) {
+    std::uint8_t v = value_to_int(values[i]);
+    if (v == value_to_int(values[i - 1])) {
+      current_length++;
+    } else {
+      runs.push_back({value_to_int(values[i - 1]), current_length});
+
+      // Track distinct values (just need to know count, not all values)
+      if (num_distinct == 1 && v != val_0) {
+        val_1 = v;
+        num_distinct = 2;
+      } else if (num_distinct == 2 && v != val_0 && v != val_1) {
+        num_distinct = 3;
+      }
+
+      current_length = 1;
+    }
+  }
+  runs.push_back({value_to_int(values[count - 1]), current_length});
+
+  // Handle single-run case (all same value)
+  if (runs.size() == 1) {
+    std::vector<std::uint8_t> result(2);
+    result[0] = val_0 & 0x3;
+    result[1] = 0;  // Marker for single-value block
+    return result;
+  }
+
+  // Handle 2-value case (no prediction bits needed, same as 2-value method)
+  if (num_distinct <= 2) {
+    return compress_rle_huffman_2val(values, count);
+  }
+
+  // Header stores actual run values:
+  // - run0_val: actual value of run 0
+  // - run1_val: actual value of run 1
+  // - third_val: the third distinct value (the one that's not run0_val or run1_val)
+  std::uint8_t run0_val = runs[0].value;
+  std::uint8_t run1_val = runs[1].value;
+
+  // Find the third value (the one that's neither run0_val nor run1_val)
+  std::uint8_t third_val = 0;
+  for (std::size_t i = 0; i < runs.size(); ++i) {
+    if (runs[i].value != run0_val && runs[i].value != run1_val) {
+      third_val = runs[i].value;
+      break;
+    }
+  }
+  // Handle edge case where run0_val == run1_val
+  if (run0_val == run1_val) {
+    // Find two distinct values that aren't run0_val
+    bool found_second = false;
+    for (std::size_t i = 0; i < runs.size(); ++i) {
+      if (runs[i].value != run0_val) {
+        if (!found_second) {
+          run1_val = runs[i].value;  // This becomes the "run1" value for bootstrapping
+          found_second = true;
+        } else if (runs[i].value != run1_val) {
+          third_val = runs[i].value;
+          break;
+        }
+      }
+    }
+  }
+
+  // Encode runs using Huffman with prediction
+  BitWriter writer;
+
+  // Track state for prediction: val_k_minus_2, val_k_minus_1
+  // Bootstrap: pretend k=-2 had run0_val, k=-1 had run1_val
+  std::uint8_t val_k_minus_2 = run0_val;
+  std::uint8_t val_k_minus_1 = run1_val;
+
+  for (std::size_t k = 0; k < runs.size(); ++k) {
+    std::uint8_t run_value = runs[k].value;
+    std::size_t run_length = runs[k].length;
+
+    if (k == 0 || k == 1) {
+      // Runs 0 and 1: values from header, treated as TRUE predictions
+      encode_true_symbol(writer, run_length);
+    } else {
+      // Run k >= 2: check if prediction (val_k_minus_2) is correct
+      if (run_value == val_k_minus_2) {
+        encode_true_symbol(writer, run_length);
+      } else {
+        // FALSE: determine which_value (0 = val_k_minus_1, 1 = third)
+        int which_value = (run_value == val_k_minus_1) ? 0 : 1;
+        encode_false_symbol(writer, run_length, which_value);
+      }
+    }
+
+    // Update state for next iteration (for all k, including 0 and 1)
+    val_k_minus_2 = val_k_minus_1;
+    val_k_minus_1 = run_value;
+  }
+
+  auto bits = writer.finish();
+
+  // Build result
+  std::vector<std::uint8_t> result;
+  result.reserve(5 + bits.size());
+
+  // Header byte: run0_val (bits 0-1) | run1_val (bits 2-3) | third_val (bits 4-5)
+  std::uint8_t header = (run0_val & 0x3) | ((run1_val & 0x3) << 2) | ((third_val & 0x3) << 4);
+  result.push_back(header);
+
+  // Run count
+  std::uint16_t run_count = static_cast<std::uint16_t>(runs.size());
+  result.push_back(run_count & 0xFF);
+  result.push_back((run_count >> 8) & 0xFF);
+
+  // Bit stream size
+  std::uint16_t bit_bytes = static_cast<std::uint16_t>(bits.size());
+  result.push_back(bit_bytes & 0xFF);
+  result.push_back((bit_bytes >> 8) & 0xFF);
+
+  // Bit stream
+  result.insert(result.end(), bits.begin(), bits.end());
+
+  return result;
+}
+
+std::vector<Value> decompress_rle_huffman_3val(const std::uint8_t* data, std::size_t data_size,
+                                                std::size_t num_values) {
+  if (num_values == 0 || data_size < 2) return std::vector<Value>(num_values, Value::UNKNOWN);
+
+  // Check for single-value block marker
+  if (data_size == 2 && data[1] == 0) {
+    std::uint8_t val = data[0] & 0x3;
+    return std::vector<Value>(num_values, int_to_value(val));
+  }
+
+  if (data_size < 5) return std::vector<Value>(num_values, Value::UNKNOWN);
+
+  // Parse header
+  std::uint8_t header = data[0];
+  std::uint8_t val_0 = header & 0x3;
+  std::uint8_t val_1 = (header >> 2) & 0x3;
+  std::uint8_t val_2 = (header >> 4) & 0x3;
+
+  std::uint16_t run_count = data[1] | (data[2] << 8);
+  std::uint16_t bit_bytes = data[3] | (data[4] << 8);
+
+  if (data_size < static_cast<std::size_t>(5) + bit_bytes) {
+    return std::vector<Value>(num_values, Value::UNKNOWN);
+  }
+
+  // Decode runs
+  BitReader reader(data + 5, bit_bytes);
+  std::vector<Value> result;
+  result.reserve(num_values);
+
+  // Track state for prediction: val_k_minus_2, val_k_minus_1
+  std::uint8_t val_k_minus_2 = val_0;
+  std::uint8_t val_k_minus_1 = val_1;
+
+  for (std::uint16_t k = 0; k < run_count && result.size() < num_values; ++k) {
+    std::uint8_t run_value;
+    std::size_t run_length;
+
+    // Decode symbol using Scheme B
+    auto [is_true, length, which_false] = decode_symbol(reader);
+    run_length = length;
+
+    if (k == 0) {
+      // Run 0: value is val_0 from header
+      run_value = val_0;
+    } else if (k == 1) {
+      // Run 1: value is val_1 from header
+      run_value = val_1;
+    } else {
+      // Run k >= 2: determine value based on prediction result
+      if (is_true) {
+        // TRUE: prediction correct, value = val_k_minus_2
+        run_value = val_k_minus_2;
+      } else {
+        // FALSE: prediction wrong
+        if (which_false == 0) {
+          // which_false == 0: value = val_k_minus_1
+          run_value = val_k_minus_1;
+        } else {
+          // which_false == 1: value = third (neither k-2 nor k-1)
+          if (val_k_minus_2 != val_0 && val_k_minus_1 != val_0) {
+            run_value = val_0;
+          } else if (val_k_minus_2 != val_1 && val_k_minus_1 != val_1) {
+            run_value = val_1;
+          } else {
+            run_value = val_2;
+          }
+        }
+      }
+    }
+
+    // Add values
+    std::size_t to_add = std::min(run_length, num_values - result.size());
+    for (std::size_t i = 0; i < to_add; ++i) {
+      result.push_back(int_to_value(run_value));
+    }
+
+    // Update state for next iteration (for all k, including 0 and 1)
+    val_k_minus_2 = val_k_minus_1;
+    val_k_minus_1 = run_value;
   }
 
   // Pad if needed

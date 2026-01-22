@@ -110,13 +110,15 @@ int main(int argc, char* argv[]) {
     std::cout << "\n";
 
     std::cout << "Compression method usage (blocks):\n";
+    // Method IDs: 0=RAW_2BIT, 2=DEFAULT_EXCEPTIONS, 3=RLE_BINARY_SEARCH,
+    // 5=HUFFMAN_RLE_MEDIUM, 7=HUFFMAN_RLE_VARIABLE, 8=RLE_HUFFMAN_2VAL, 9=RLE_HUFFMAN_3VAL
     const char* method_names[] = {
-      "RAW_2BIT", "TERNARY_BASE3", "DEFAULT_EXCEPTIONS", "RLE_BINARY_SEARCH",
-      "HUFFMAN_RLE_SHORT", "HUFFMAN_RLE_MEDIUM", "HUFFMAN_RLE_LONG", "HUFFMAN_RLE_VARIABLE",
-      "RLE_HUFFMAN_2VAL"
+      "RAW_2BIT", nullptr, "DEFAULT_EXCEPTIONS", "RLE_BINARY_SEARCH",
+      nullptr, "HUFFMAN_RLE_MEDIUM", nullptr, "HUFFMAN_RLE_VARIABLE",
+      "RLE_HUFFMAN_2VAL", "RLE_HUFFMAN_3VAL"
     };
-    for (int i = 0; i < 9; ++i) {
-      if (method_counts[i] > 0) {
+    for (int i = 0; i < 10; ++i) {
+      if (method_counts[i] > 0 && method_names[i] != nullptr) {
         double pct = 100.0 * method_counts[i] / total_blocks;
         std::cout << "  " << std::setw(20) << method_names[i] << ": "
                   << std::setw(8) << method_counts[i] << " ("

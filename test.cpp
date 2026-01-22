@@ -877,51 +877,6 @@ TEST(raw_2bit_expected_size) {
   ASSERT_EQ(expected_compressed_size(1, CompressionMethod::RAW_2BIT), 1u);
 }
 
-TEST(ternary_base3_roundtrip) {
-  // Test that TERNARY_BASE3 compression round-trips correctly
-  // Only 3 distinct values
-  std::vector<Value> values = {
-    Value::WIN, Value::LOSS, Value::DRAW,
-    Value::WIN, Value::WIN, Value::LOSS, Value::DRAW,
-    Value::DRAW, Value::LOSS, Value::WIN,
-  };
-
-  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::TERNARY_BASE3);
-  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::TERNARY_BASE3);
-
-  ASSERT_EQ(decompressed.size(), values.size());
-  for (std::size_t i = 0; i < values.size(); ++i) {
-    ASSERT(decompressed[i] == values[i]);
-  }
-}
-
-TEST(ternary_base3_expected_size) {
-  // Method 1 produces ~3277 bytes for 16384 ternary values
-  // 1 header + ceil(16384/5) = 1 + 3277 = 3278 bytes
-  ASSERT_EQ(expected_compressed_size(BLOCK_SIZE, CompressionMethod::TERNARY_BASE3), 3278u);
-  ASSERT_EQ(expected_compressed_size(10, CompressionMethod::TERNARY_BASE3), 3u);  // 1 header + 2 data
-  ASSERT_EQ(expected_compressed_size(5, CompressionMethod::TERNARY_BASE3), 2u);   // 1 header + 1 data
-}
-
-TEST(ternary_fallback_on_4_values) {
-  // If a block has all 4 values, ternary should fall back to raw
-  std::vector<Value> values = {
-    Value::WIN, Value::LOSS, Value::DRAW, Value::UNKNOWN,
-    Value::WIN, Value::LOSS,
-  };
-
-  // Request ternary, but should get raw 2-bit because 4 distinct values
-  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::TERNARY_BASE3);
-
-  // Should still round-trip correctly
-  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::RAW_2BIT);
-
-  ASSERT_EQ(decompressed.size(), values.size());
-  for (std::size_t i = 0; i < values.size(); ++i) {
-    ASSERT(decompressed[i] == values[i]);
-  }
-}
-
 TEST(compress_block_best_selects_smallest) {
   // Create a block where most values are the same with a few exceptions.
   std::vector<Value> values(100, Value::WIN);
@@ -1320,15 +1275,15 @@ TEST(rle_best_selection) {
 // =============================================================================
 
 TEST(huffman_short_roundtrip) {
-  // Test HUFFMAN_RLE_SHORT round-trip
+  // Test HUFFMAN_RLE_MEDIUM round-trip
   std::vector<Value> values;
   for (int i = 0; i < 100; ++i) values.push_back(Value::WIN);
   for (int i = 0; i < 50; ++i) values.push_back(Value::LOSS);
   for (int i = 0; i < 100; ++i) values.push_back(Value::DRAW);
   for (int i = 0; i < 50; ++i) values.push_back(Value::WIN);
 
-  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::HUFFMAN_RLE_SHORT);
-  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::HUFFMAN_RLE_SHORT);
+  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::HUFFMAN_RLE_MEDIUM);
+  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::HUFFMAN_RLE_MEDIUM);
 
   ASSERT_EQ(decompressed.size(), values.size());
   for (std::size_t i = 0; i < values.size(); ++i) {
@@ -1359,8 +1314,8 @@ TEST(huffman_two_values_roundtrip) {
   for (int i = 0; i < 100; ++i) values.push_back(Value::LOSS);
   for (int i = 0; i < 200; ++i) values.push_back(Value::WIN);
 
-  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::HUFFMAN_RLE_SHORT);
-  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::HUFFMAN_RLE_SHORT);
+  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::HUFFMAN_RLE_MEDIUM);
+  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::HUFFMAN_RLE_MEDIUM);
 
   ASSERT_EQ(decompressed.size(), values.size());
   for (std::size_t i = 0; i < values.size(); ++i) {
@@ -1372,8 +1327,8 @@ TEST(huffman_single_value_block) {
   // Test with all same value (single run)
   std::vector<Value> values(1000, Value::DRAW);
 
-  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::HUFFMAN_RLE_SHORT);
-  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::HUFFMAN_RLE_SHORT);
+  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::HUFFMAN_RLE_MEDIUM);
+  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::HUFFMAN_RLE_MEDIUM);
 
   ASSERT_EQ(decompressed.size(), values.size());
   for (std::size_t i = 0; i < values.size(); ++i) {
@@ -1391,8 +1346,8 @@ TEST(huffman_alternating) {
     values.push_back(i % 2 == 0 ? Value::WIN : Value::LOSS);
   }
 
-  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::HUFFMAN_RLE_SHORT);
-  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::HUFFMAN_RLE_SHORT);
+  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::HUFFMAN_RLE_MEDIUM);
+  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::HUFFMAN_RLE_MEDIUM);
 
   ASSERT_EQ(decompressed.size(), values.size());
   for (std::size_t i = 0; i < values.size(); ++i) {
@@ -1413,6 +1368,126 @@ TEST(huffman_best_vs_rle) {
   // Huffman: header (5 bytes) + encoded runs > 4 bytes
   ASSERT(method == CompressionMethod::RLE_BINARY_SEARCH);
   ASSERT_EQ(data.size(), 4u);
+}
+
+// ============================================================================
+// RLE_HUFFMAN_3VAL Tests (Method 9)
+// ============================================================================
+
+TEST(huffman_3val_roundtrip_basic) {
+  // Test with 3 distinct values: WIN, LOSS, DRAW alternating
+  std::vector<Value> values;
+  for (int i = 0; i < 100; ++i) values.push_back(Value::WIN);
+  for (int i = 0; i < 100; ++i) values.push_back(Value::LOSS);
+  for (int i = 0; i < 100; ++i) values.push_back(Value::DRAW);
+  for (int i = 0; i < 100; ++i) values.push_back(Value::WIN);
+  for (int i = 0; i < 100; ++i) values.push_back(Value::LOSS);
+
+  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::RLE_HUFFMAN_3VAL);
+  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::RLE_HUFFMAN_3VAL);
+
+  ASSERT_EQ(decompressed.size(), values.size());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    ASSERT(decompressed[i] == values[i]);
+  }
+}
+
+TEST(huffman_3val_prediction_pattern) {
+  // Test the prediction pattern: runs 0,1,2,3,... where prediction k = val[k-2]
+  // Pattern: WIN, LOSS, WIN, LOSS, WIN, LOSS (alternating = prediction correct)
+  std::vector<Value> values;
+  for (int cycle = 0; cycle < 50; ++cycle) {
+    // Each cycle: WIN, LOSS
+    for (int i = 0; i < 10; ++i) values.push_back(Value::WIN);
+    for (int i = 0; i < 10; ++i) values.push_back(Value::LOSS);
+  }
+  // Add some DRAW runs to make it 3-value
+  for (int i = 0; i < 20; ++i) values.push_back(Value::DRAW);
+
+  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::RLE_HUFFMAN_3VAL);
+  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::RLE_HUFFMAN_3VAL);
+
+  ASSERT_EQ(decompressed.size(), values.size());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    ASSERT(decompressed[i] == values[i]);
+  }
+}
+
+TEST(huffman_3val_false_prediction) {
+  // Test with patterns where prediction fails (third value appears)
+  // WIN, LOSS, DRAW, DRAW, DRAW, WIN, LOSS, DRAW, ...
+  // This has many FALSE predictions which test the escape sequence
+  std::vector<Value> values;
+  for (int cycle = 0; cycle < 30; ++cycle) {
+    for (int i = 0; i < 10; ++i) values.push_back(Value::WIN);
+    for (int i = 0; i < 10; ++i) values.push_back(Value::LOSS);
+    for (int i = 0; i < 10; ++i) values.push_back(Value::DRAW);  // FALSE - not WIN
+  }
+
+  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::RLE_HUFFMAN_3VAL);
+  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::RLE_HUFFMAN_3VAL);
+
+  ASSERT_EQ(decompressed.size(), values.size());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    ASSERT(decompressed[i] == values[i]);
+  }
+}
+
+TEST(huffman_3val_long_runs) {
+  // Test with long runs (trigger larger length encodings)
+  std::vector<Value> values;
+  for (int i = 0; i < 3000; ++i) values.push_back(Value::WIN);
+  for (int i = 0; i < 2000; ++i) values.push_back(Value::LOSS);
+  for (int i = 0; i < 1000; ++i) values.push_back(Value::DRAW);
+  for (int i = 0; i < 500; ++i) values.push_back(Value::WIN);
+
+  auto compressed = compress_block(values.data(), values.size(), CompressionMethod::RLE_HUFFMAN_3VAL);
+  auto decompressed = decompress_block(compressed.data(), compressed.size(), values.size(), CompressionMethod::RLE_HUFFMAN_3VAL);
+
+  ASSERT_EQ(decompressed.size(), values.size());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    ASSERT(decompressed[i] == values[i]);
+  }
+}
+
+TEST(huffman_3val_compress_block_best_selects) {
+  // Test that compress_block_best correctly compresses 3-value blocks
+  std::vector<Value> values;
+  // Many short alternating runs - should favor Huffman over RLE
+  for (int cycle = 0; cycle < 500; ++cycle) {
+    values.push_back(Value::WIN);
+    values.push_back(Value::LOSS);
+    values.push_back(Value::DRAW);
+  }
+
+  auto [method, data] = compress_block_best(values.data(), values.size());
+
+  // The best method depends on the data - accept any valid compression
+  // For 1500 values with 1500 runs of length 1, various methods may win
+  // Just verify round-trip works correctly
+  auto decompressed = decompress_block(data.data(), data.size(), values.size(), method);
+  ASSERT_EQ(decompressed.size(), values.size());
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    ASSERT(decompressed[i] == values[i]);
+  }
+
+  // Also test RLE_HUFFMAN_3VAL specifically with a pattern that should favor it
+  // Pattern: alternating WIN-LOSS with occasional DRAW (high prediction accuracy)
+  std::vector<Value> pred_values;
+  for (int i = 0; i < 100; ++i) {
+    for (int j = 0; j < 10; ++j) pred_values.push_back(Value::WIN);
+    for (int j = 0; j < 10; ++j) pred_values.push_back(Value::LOSS);
+  }
+  pred_values.push_back(Value::DRAW);  // Add third value
+
+  auto compressed_3val = compress_block(pred_values.data(), pred_values.size(),
+                                         CompressionMethod::RLE_HUFFMAN_3VAL);
+  auto decompressed_3val = decompress_block(compressed_3val.data(), compressed_3val.size(),
+                                             pred_values.size(), CompressionMethod::RLE_HUFFMAN_3VAL);
+  ASSERT_EQ(decompressed_3val.size(), pred_values.size());
+  for (std::size_t i = 0; i < pred_values.size(); ++i) {
+    ASSERT(decompressed_3val[i] == pred_values[i]);
+  }
 }
 
 // ============================================================================
@@ -1601,9 +1676,6 @@ int main() {
   std::cout << "\nRunning compression tests (Stage 3):\n";
   RUN_TEST(raw_2bit_roundtrip);
   RUN_TEST(raw_2bit_expected_size);
-  RUN_TEST(ternary_base3_roundtrip);
-  RUN_TEST(ternary_base3_expected_size);
-  RUN_TEST(ternary_fallback_on_4_values);
   RUN_TEST(compress_block_best_selects_smallest);
   RUN_TEST(block_indexing);
   RUN_TEST(lru_cache_eviction);
@@ -1632,6 +1704,13 @@ int main() {
   RUN_TEST(huffman_single_value_block);
   RUN_TEST(huffman_alternating);
   RUN_TEST(huffman_best_vs_rle);
+
+  std::cout << "\nRunning 3-value Huffman RLE tests (Method 9):\n";
+  RUN_TEST(huffman_3val_roundtrip_basic);
+  RUN_TEST(huffman_3val_prediction_pattern);
+  RUN_TEST(huffman_3val_false_prediction);
+  RUN_TEST(huffman_3val_long_runs);
+  RUN_TEST(huffman_3val_compress_block_best_selects);
 
   std::cout << "\nRunning File I/O tests (Stage 5):\n";
   RUN_TEST(compressed_file_roundtrip);
