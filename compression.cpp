@@ -720,6 +720,10 @@ std::pair<CompressionMethod, std::vector<std::uint8_t>> compress_block_best(
   }
 
   // Try Huffman RLE methods for blocks with 3+ values
+  // NOTE: HUFFMAN_RLE_MEDIUM and HUFFMAN_RLE_VARIABLE have decompression bugs
+  // that cause WIN values to become UNKNOWN. Disabled until fixed.
+  // See: compress_huffman_rle / decompress_huffman_rle header encoding mismatch.
+#if 0
   if (num_distinct >= 3) {
     constexpr CompressionMethod huffman_methods[] = {
       CompressionMethod::HUFFMAN_RLE_MEDIUM,
@@ -734,6 +738,7 @@ std::pair<CompressionMethod, std::vector<std::uint8_t>> compress_block_best(
       }
     }
   }
+#endif
 
   return {best_method, std::move(best_data)};
 }

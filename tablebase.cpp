@@ -214,6 +214,15 @@ std::string tablebase_filename(const Material& m) {
   return oss.str();
 }
 
+// Filename for a compressed WDL tablebase
+std::string compressed_tablebase_filename(const Material& m) {
+  std::ostringstream oss;
+  oss << "cwdl_" << m.back_white_pawns << m.back_black_pawns
+      << m.other_white_pawns << m.other_black_pawns
+      << m.white_queens << m.black_queens << ".bin";
+  return oss.str();
+}
+
 // Save tablebase to file
 void save_tablebase(const std::vector<Value>& table, const Material& m) {
   std::string filename = tablebase_filename(m);

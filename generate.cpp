@@ -1,7 +1,9 @@
 #include "tablebase.h"
 #include "board.h"
 #include "movegen.h"
+#include "compression.h"
 #include <iostream>
+#include <iomanip>
 #include <vector>
 #include <queue>
 #include <unordered_set>
@@ -218,6 +220,81 @@ Value compute_position_value(
   return Value::UNKNOWN;  // Still undetermined
 }
 
+// Compute value for a single position using compressed tablebases for dependencies
+// Uses full vectors for same-material lookups (m, flip(m))
+// Uses CompressedTablebaseManager for different-material lookups
+Value compute_position_value_compressed(
+    std::size_t idx,
+    const Material& m,
+    const std::vector<Value>& table_m,
+    const std::vector<Value>& table_fm,
+    CompressedTablebaseManager* manager) {
+
+  Board board = index_to_board(idx, m);
+  std::vector<Move> moves;
+  generateMoves(board, moves);
+
+  if (moves.empty()) return Value::LOSS;
+
+  Material fm = flip(m);
+  bool symmetric = (m == fm);
+
+  bool found_loss = false;
+  bool has_draw = false;
+  bool has_unknown = false;
+  std::size_t num_wins = 0;
+
+  for (const Move& move : moves) {
+    Board next = makeMove(board, move);
+    Material next_m = get_material(next);
+
+    Value succ_val = Value::UNKNOWN;
+
+    // Terminal capture (opponent eliminated)
+    if (next_m.white_pieces() == 0) {
+      succ_val = Value::LOSS;  // Opponent loses
+    } else if (next_m.black_pieces() == 0) {
+      succ_val = Value::WIN;   // Shouldn't happen, but treat as bad
+    } else if (next_m == fm) {
+      // Quiet move: lookup in flip(m)'s table
+      std::size_t next_idx = board_to_index(next, fm);
+      if (symmetric) {
+        succ_val = table_m[next_idx];
+      } else {
+        succ_val = table_fm[next_idx];
+      }
+    } else {
+      // Material-changing move: lookup in compressed tablebase via manager
+      succ_val = manager->lookup_wdl(next);
+    }
+
+    if (succ_val == Value::LOSS) {
+      found_loss = true;
+    } else if (succ_val == Value::WIN) {
+      num_wins++;
+    } else if (succ_val == Value::DRAW) {
+      has_draw = true;
+    } else {
+      has_unknown = true;
+    }
+  }
+
+  if (found_loss) {
+    return Value::WIN;
+  }
+  if (num_wins == moves.size()) {
+    return Value::LOSS;
+  }
+  if (!has_unknown && has_draw) {
+    return Value::DRAW;
+  }
+  if (!has_unknown) {
+    return Value::DRAW;
+  }
+
+  return Value::UNKNOWN;
+}
+
 // Generate tablebase(s) for material M (and flip(M) if different)
 // Uses position-level parallelism with level-synchronized iteration
 void generate_wdl_parallel(
@@ -306,6 +383,130 @@ void generate_wdl_parallel(
     save_tablebase(table_fm, fm);
     store_wdl_tablebase(fm, std::move(table_fm));
   }
+}
+
+// Generate tablebase(s) for material M using compressed tablebases for dependencies.
+// Uses position-level parallelism with thread-local managers for thread safety.
+// Saves only compressed output (cwdl_*.bin), not uncompressed tb_*.bin.
+void generate_wdl_parallel_compressed(
+    const Material& m,
+    const std::string& tb_directory) {
+
+  Material fm = flip(m);
+  bool symmetric = (m == fm);
+
+  std::size_t size_m = material_size(m);
+  std::size_t size_fm = symmetric ? 0 : material_size(fm);
+
+  std::vector<Value> table_m(size_m, Value::UNKNOWN);
+  std::vector<Value> table_fm(size_fm, Value::UNKNOWN);
+
+  auto start = std::chrono::high_resolution_clock::now();
+
+  // Create thread-local managers for parallel lookups
+  int num_threads = omp_get_max_threads();
+  std::vector<std::unique_ptr<CompressedTablebaseManager>> thread_managers;
+  for (int i = 0; i < num_threads; ++i) {
+    thread_managers.push_back(
+        std::make_unique<CompressedTablebaseManager>(tb_directory, 32));
+  }
+
+  // Iterate until stable
+  int iteration = 0;
+  bool changed = true;
+
+  while (changed) {
+    changed = false;
+    iteration++;
+
+    // Update table_m in parallel
+    #pragma omp parallel for schedule(dynamic, 1024) reduction(||:changed)
+    for (std::size_t idx = 0; idx < size_m; ++idx) {
+      if (table_m[idx] != Value::UNKNOWN) continue;
+
+      auto* mgr = thread_managers[omp_get_thread_num()].get();
+      Value new_val = compute_position_value_compressed(idx, m, table_m, table_fm, mgr);
+      if (new_val != Value::UNKNOWN) {
+        table_m[idx] = new_val;
+        changed = true;
+      }
+    }
+
+    if (!symmetric) {
+      // Update table_fm in parallel
+      #pragma omp parallel for schedule(dynamic, 1024) reduction(||:changed)
+      for (std::size_t idx = 0; idx < size_fm; ++idx) {
+        if (table_fm[idx] != Value::UNKNOWN) continue;
+
+        auto* mgr = thread_managers[omp_get_thread_num()].get();
+        Value new_val = compute_position_value_compressed(idx, fm, table_fm, table_m, mgr);
+        if (new_val != Value::UNKNOWN) {
+          table_fm[idx] = new_val;
+          changed = true;
+        }
+      }
+    }
+  }
+
+  // Mark remaining as DRAW
+  std::size_t wins_m = 0, losses_m = 0, draws_m = 0;
+  #pragma omp parallel for reduction(+:wins_m,losses_m,draws_m)
+  for (std::size_t idx = 0; idx < size_m; ++idx) {
+    if (table_m[idx] == Value::UNKNOWN) table_m[idx] = Value::DRAW;
+    if (table_m[idx] == Value::WIN) wins_m++;
+    else if (table_m[idx] == Value::LOSS) losses_m++;
+    else draws_m++;
+  }
+
+  auto end = std::chrono::high_resolution_clock::now();
+  auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
+  std::cout << m << " (" << size_m << " pos): "
+            << wins_m << "W/" << losses_m << "L/" << draws_m << "D, "
+            << iteration << " iters, " << duration.count() << "ms" << std::endl;
+
+  // Mark don't-care positions and compress
+  CompressionStats cstats;
+  std::vector<Value> marked_m = mark_dont_care_positions(table_m, m, cstats);
+  CompressedTablebase ctb_m = compress_tablebase(marked_m, m);
+
+  std::string filename_m = tb_directory + "/" + compressed_tablebase_filename(m);
+  save_compressed_tablebase(ctb_m, filename_m);
+
+  BlockCompressionStats bstats_m = analyze_block_compression(ctb_m);
+  std::cout << "  Saved " << filename_m << " ("
+            << bstats_m.compressed_size << " bytes, "
+            << std::fixed << std::setprecision(1) << bstats_m.compression_ratio() << "x ratio)"
+            << std::endl;
+
+  if (!symmetric) {
+    std::size_t wins_fm = 0, losses_fm = 0, draws_fm = 0;
+    #pragma omp parallel for reduction(+:wins_fm,losses_fm,draws_fm)
+    for (std::size_t idx = 0; idx < size_fm; ++idx) {
+      if (table_fm[idx] == Value::UNKNOWN) table_fm[idx] = Value::DRAW;
+      if (table_fm[idx] == Value::WIN) wins_fm++;
+      else if (table_fm[idx] == Value::LOSS) losses_fm++;
+      else draws_fm++;
+    }
+
+    std::cout << fm << " (" << size_fm << " pos): "
+              << wins_fm << "W/" << losses_fm << "L/" << draws_fm << "D" << std::endl;
+
+    CompressionStats cstats_fm;
+    std::vector<Value> marked_fm = mark_dont_care_positions(table_fm, fm, cstats_fm);
+    CompressedTablebase ctb_fm = compress_tablebase(marked_fm, fm);
+
+    std::string filename_fm = tb_directory + "/" + compressed_tablebase_filename(fm);
+    save_compressed_tablebase(ctb_fm, filename_fm);
+
+    BlockCompressionStats bstats_fm = analyze_block_compression(ctb_fm);
+    std::cout << "  Saved " << filename_fm << " ("
+              << bstats_fm.compressed_size << " bytes, "
+              << std::fixed << std::setprecision(1) << bstats_fm.compression_ratio() << "x ratio)"
+              << std::endl;
+  }
+
+  // Don't cache in g_wdl_tablebases - we want to save memory
 }
 
 // Legacy single-threaded generate for compatibility
@@ -1002,6 +1203,181 @@ void solve_all_parallel(int max_pieces, bool load_existing = false) {
   std::cout << "\nTotal generation time: " << total_duration.count() << "s" << std::endl;
 }
 
+// Solve all materials up to max_pieces using compressed-only mode.
+// For large endgames (>= threshold), uses compressed dependencies to save memory.
+// Small endgames use the traditional method but also save compressed output.
+void solve_all_parallel_compressed(int max_pieces, int threshold, const std::string& tb_directory) {
+  std::vector<Material> all = all_materials(max_pieces);
+
+  std::cout << "=== Compressed-Only Tablebase Generation ===" << std::endl;
+  std::cout << "Using " << omp_get_max_threads() << " threads (position-level parallelism)" << std::endl;
+  std::cout << "Compressed mode threshold: " << threshold << "+ pieces" << std::endl;
+  std::cout << "Output directory: " << tb_directory << std::endl;
+  std::cout << "Total materials: " << all.size() << std::endl;
+
+  // Canonicalize materials
+  std::unordered_map<Material, Material> canonical;
+  std::unordered_set<Material> canonical_set;
+
+  auto material_less = [](const Material& a, const Material& b) {
+    if (a.back_white_pawns != b.back_white_pawns) return a.back_white_pawns < b.back_white_pawns;
+    if (a.back_black_pawns != b.back_black_pawns) return a.back_black_pawns < b.back_black_pawns;
+    if (a.other_white_pawns != b.other_white_pawns) return a.other_white_pawns < b.other_white_pawns;
+    if (a.other_black_pawns != b.other_black_pawns) return a.other_black_pawns < b.other_black_pawns;
+    if (a.white_queens != b.white_queens) return a.white_queens < b.white_queens;
+    return a.black_queens < b.black_queens;
+  };
+
+  for (const Material& m : all) {
+    Material f = flip(m);
+    if (canonical.find(m) == canonical.end()) {
+      Material c = material_less(m, f) ? m : f;
+      canonical[m] = c;
+      canonical[f] = c;
+      canonical_set.insert(c);
+    }
+  }
+
+  std::vector<Material> work_units(canonical_set.begin(), canonical_set.end());
+  std::cout << "Work units (canonical materials): " << work_units.size() << std::endl;
+
+  // Build dependency graph
+  std::unordered_map<Material, std::unordered_set<Material>> deps_map;
+  std::unordered_map<Material, int> dep_count;
+
+  for (const Material& m : work_units) {
+    std::vector<Material> deps = get_dependencies(m);
+    std::unordered_set<Material> canonical_deps;
+    for (const Material& dep : deps) {
+      Material c = canonical[dep];
+      if (!(c == m) && canonical_set.find(c) != canonical_set.end()) {
+        canonical_deps.insert(c);
+      }
+    }
+    deps_map[m] = canonical_deps;
+    dep_count[m] = canonical_deps.size();
+  }
+
+  // Topological sort using Kahn's algorithm
+  std::vector<Material> sorted;
+  std::queue<Material> ready;
+
+  for (const Material& m : work_units) {
+    if (dep_count[m] == 0) {
+      ready.push(m);
+    }
+  }
+
+  while (!ready.empty()) {
+    Material m = ready.front();
+    ready.pop();
+    sorted.push_back(m);
+
+    for (const Material& other : work_units) {
+      if (deps_map[other].count(m)) {
+        dep_count[other]--;
+        if (dep_count[other] == 0) {
+          ready.push(other);
+        }
+      }
+    }
+  }
+
+  if (sorted.size() != work_units.size()) {
+    std::cerr << "ERROR: Dependency cycle detected!" << std::endl;
+    return;
+  }
+
+  std::cout << std::endl;
+
+  auto total_start = std::chrono::high_resolution_clock::now();
+
+  // Create a manager to check for existing compressed tablebases
+  CompressedTablebaseManager check_manager(tb_directory, 1);
+
+  // Process materials in dependency order
+  for (const Material& m : sorted) {
+    Material f = flip(m);
+
+    // Check if already exists (compressed)
+    if (check_manager.get_tablebase(m)) {
+      std::cout << "Skipping " << m;
+      if (!(f == m)) std::cout << " <-> " << f;
+      std::cout << " (cwdl already exists)" << std::endl;
+      continue;
+    }
+
+    if (m.total_pieces() >= threshold) {
+      // Large endgame: use compressed mode
+      std::cout << "\n[COMPRESSED] ";
+      generate_wdl_parallel_compressed(m, tb_directory);
+      // Force reload of the manager cache after new tablebase is saved
+      check_manager.clear();
+    } else {
+      // Small endgame: use traditional method + save compressed copy
+      std::vector<Material> deps = get_sub_materials(m);
+      std::unordered_map<Material, std::vector<Value>> dep_tables;
+
+      for (const Material& dep : deps) {
+        if (dep.white_pieces() == 0 || dep.black_pieces() == 0) continue;
+
+        std::vector<Value> tb = get_wdl_tablebase(dep);
+        if (tb.empty()) {
+          tb = load_tablebase(dep);
+        }
+        if (!tb.empty()) {
+          dep_tables[dep] = std::move(tb);
+        }
+      }
+
+      // Verify dependencies
+      verify_dependencies(m, deps, dep_tables);
+
+      // Generate using position-level parallelism
+      generate_wdl_parallel(m, dep_tables);
+
+      // Also save compressed versions
+      std::vector<Value> table_m = get_wdl_tablebase(m);
+      if (!table_m.empty()) {
+        CompressionStats cstats_m;
+        std::vector<Value> marked_m = mark_dont_care_positions(table_m, m, cstats_m);
+        CompressedTablebase ctb_m = compress_tablebase(marked_m, m);
+        std::string filename_m = tb_directory + "/" + compressed_tablebase_filename(m);
+        save_compressed_tablebase(ctb_m, filename_m);
+
+        BlockCompressionStats bstats_m = analyze_block_compression(ctb_m);
+        std::cout << "  Saved " << filename_m << " ("
+                  << bstats_m.compressed_size << " bytes, "
+                  << std::fixed << std::setprecision(1) << bstats_m.compression_ratio() << "x ratio)"
+                  << std::endl;
+      }
+
+      if (!(f == m)) {
+        std::vector<Value> table_fm = get_wdl_tablebase(f);
+        if (!table_fm.empty()) {
+          CompressionStats cstats_fm;
+          std::vector<Value> marked_fm = mark_dont_care_positions(table_fm, f, cstats_fm);
+          CompressedTablebase ctb_fm = compress_tablebase(marked_fm, f);
+          std::string filename_fm = tb_directory + "/" + compressed_tablebase_filename(f);
+          save_compressed_tablebase(ctb_fm, filename_fm);
+
+          BlockCompressionStats bstats_fm = analyze_block_compression(ctb_fm);
+          std::cout << "  Saved " << filename_fm << " ("
+                    << bstats_fm.compressed_size << " bytes, "
+                    << std::fixed << std::setprecision(1) << bstats_fm.compression_ratio() << "x ratio)"
+                    << std::endl;
+        }
+      }
+
+      check_manager.clear();
+    }
+  }
+
+  auto total_end = std::chrono::high_resolution_clock::now();
+  auto total_duration = std::chrono::duration_cast<std::chrono::seconds>(total_end - total_start);
+  std::cout << "\nTotal generation time: " << total_duration.count() << "s" << std::endl;
+}
+
 // Solve all DTM tablebases using position-level parallelism
 // Materials are processed sequentially in dependency order, but each material
 // uses all available cores for parallel position processing.
@@ -1212,6 +1588,10 @@ void print_usage(const char* program) {
   std::cerr << "                  Requires WDL tablebases to exist first" << std::endl;
   std::cerr << "  --load-existing Load existing tablebases from disk instead of regenerating" << std::endl;
   std::cerr << "                  Useful for resuming interrupted generation" << std::endl;
+  std::cerr << "  --compressed    Enable compressed-only mode for 8+ piece endgames" << std::endl;
+  std::cerr << "                  Saves only cwdl_*.bin files, loads deps from compressed" << std::endl;
+  std::cerr << "  --threshold N   Use compressed mode for N+ piece endgames (default 7)" << std::endl;
+  std::cerr << "  --dir PATH      Output directory for tablebases (default: current dir)" << std::endl;
 }
 
 // Generate all material configurations with up to n total pieces
@@ -1697,6 +2077,9 @@ int main(int argc, char* argv[]) {
   // Parse option flags
   bool generate_dtm_flag = false;
   bool load_existing_flag = false;
+  bool compressed_flag = false;
+  int threshold = 7;  // Default: use compressed mode for 7+ pieces
+  std::string tb_directory = ".";
   int arg_offset = 1;
 
   while (arg_offset < argc && argv[arg_offset][0] == '-' && argv[arg_offset][1] == '-') {
@@ -1706,6 +2089,27 @@ int main(int argc, char* argv[]) {
     } else if (std::strcmp(argv[arg_offset], "--load-existing") == 0) {
       load_existing_flag = true;
       arg_offset++;
+    } else if (std::strcmp(argv[arg_offset], "--compressed") == 0) {
+      compressed_flag = true;
+      arg_offset++;
+    } else if (std::strcmp(argv[arg_offset], "--threshold") == 0) {
+      if (arg_offset + 1 >= argc) {
+        std::cerr << "Error: --threshold requires a number" << std::endl;
+        return 1;
+      }
+      threshold = std::atoi(argv[arg_offset + 1]);
+      if (threshold < 2 || threshold > 8) {
+        std::cerr << "Threshold must be between 2 and 8" << std::endl;
+        return 1;
+      }
+      arg_offset += 2;
+    } else if (std::strcmp(argv[arg_offset], "--dir") == 0) {
+      if (arg_offset + 1 >= argc) {
+        std::cerr << "Error: --dir requires a path" << std::endl;
+        return 1;
+      }
+      tb_directory = argv[arg_offset + 1];
+      arg_offset += 2;
     } else {
       break;  // Not an option flag, must be a command
     }
@@ -1741,7 +2145,13 @@ int main(int argc, char* argv[]) {
       return 1;
     }
 
-    if (generate_dtm_flag) {
+    if (compressed_flag) {
+      if (generate_dtm_flag) {
+        std::cerr << "Error: --compressed mode does not support --dtm yet" << std::endl;
+        return 1;
+      }
+      solve_all_parallel_compressed(max_pieces, threshold, tb_directory);
+    } else if (generate_dtm_flag) {
       solve_all_dtm_parallel(max_pieces, load_existing_flag);
     } else {
       solve_all_parallel(max_pieces, load_existing_flag);

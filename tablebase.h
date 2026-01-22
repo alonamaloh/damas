@@ -102,6 +102,9 @@ Board index_to_board(std::size_t idx, const Material& m);
 // Filename for a material configuration
 std::string tablebase_filename(const Material& m);
 
+// Filename for a compressed WDL tablebase
+std::string compressed_tablebase_filename(const Material& m);
+
 // Save tablebase to file
 void save_tablebase(const std::vector<Value>& table, const Material& m);
 

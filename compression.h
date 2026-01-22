@@ -144,9 +144,9 @@ struct CompressedBlock {
 
 // Compressed tablebase structure
 struct CompressedTablebase {
-  Material material;
-  std::uint32_t num_positions;
-  std::uint32_t num_blocks;
+  Material material{};
+  std::uint32_t num_positions = 0;
+  std::uint32_t num_blocks = 0;
   std::vector<std::uint32_t> block_offsets;  // Offset to each block's data
   std::vector<std::uint8_t> block_data;      // Concatenated compressed blocks
 
