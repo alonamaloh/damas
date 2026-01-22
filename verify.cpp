@@ -15,6 +15,7 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <omp.h>
 
 namespace {
 
@@ -207,6 +208,7 @@ void print_board(const Board& b) {
 }
 
 template<typename Lookup>
+[[maybe_unused]]
 void show_wdl_error(const Board& b, std::size_t idx,
                     Value stored, Value computed, Lookup&& lookup) {
   std::cout << "  WDL ERROR at index " << idx << ":\n";
@@ -225,6 +227,7 @@ void show_wdl_error(const Board& b, std::size_t idx,
   }
 }
 
+[[maybe_unused]]
 void show_dtm_error(const Board& b, std::size_t idx,
                     DTM stored, DTM computed, UncompressedTables& tables) {
   std::cout << "  DTM ERROR at index " << idx << ":\n";
@@ -250,26 +253,25 @@ struct VerifyStats {
   std::size_t dtm_errors = 0;
 };
 
-template<typename Lookup>
+template<typename Lookup, typename GetStored>
 VerifyStats verify_wdl(const Material& m, std::size_t size,
                        Lookup&& lookup,
-                       std::function<Value(std::size_t)> get_stored,
-                       bool verbose) {
+                       GetStored&& get_stored) {
   VerifyStats stats;
+  std::size_t wdl_errors = 0;
 
+  #pragma omp parallel for reduction(+:wdl_errors) schedule(dynamic, 1024)
   for (std::size_t idx = 0; idx < size; ++idx) {
     Board board = index_to_board(idx, m);
     Value stored = get_stored(idx);
     Value computed = compute_wdl(board, lookup);
 
     if (stored != computed) {
-      stats.wdl_errors++;
-      if (verbose) {
-        show_wdl_error(board, idx, stored, computed, lookup);
-      }
+      wdl_errors++;
     }
   }
 
+  stats.wdl_errors = wdl_errors;
   return stats;
 }
 
@@ -426,6 +428,28 @@ int main(int argc, char* argv[]) {
       std::cout << "Verifying " << m << " (" << size << " positions)...";
       std::cout.flush();
 
+      // Pre-load sub-tablebases for positions reachable after captures
+      // This makes lookup thread-safe (read-only access during parallel loop)
+      for (int wp = m.white_pieces(); wp >= 1; --wp) {
+        for (int bp = m.black_pieces(); bp >= 1; --bp) {
+          if (wp + bp > m.total_pieces()) continue;
+          // Generate all materials with these piece counts
+          for (int bwp = 0; bwp <= std::min(4, wp); ++bwp) {
+            for (int owp = 0; owp <= wp - bwp; ++owp) {
+              int wq = wp - bwp - owp;
+              for (int bbp = 0; bbp <= std::min(4, bp); ++bbp) {
+                for (int obp = 0; obp <= bp - bbp; ++obp) {
+                  int bq = bp - bbp - obp;
+                  Material sub{bwp, bbp, owp, obp, wq, bq};
+                  manager.get_tablebase(sub);  // Pre-load (ignore result)
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Thread-safe lookup (all tablebases pre-loaded)
       auto lookup = [&manager](const Board& pos) -> int {
         Material pm = get_material(pos);
         if (pm.white_pieces() == 0) return SCORE_LOSS;
@@ -436,7 +460,9 @@ int main(int argc, char* argv[]) {
 
       // For compressed tablebases, only verify quiet positions.
       // Don't-care positions (with captures) don't store values.
-      VerifyStats stats;
+      std::size_t wdl_errors = 0;
+
+      #pragma omp parallel for reduction(+:wdl_errors) schedule(dynamic, 1024)
       for (std::size_t idx = 0; idx < size; ++idx) {
         Board board = index_to_board(idx, m);
 
@@ -449,12 +475,13 @@ int main(int argc, char* argv[]) {
         Value computed = compute_wdl(board, lookup);
 
         if (stored != computed) {
-          stats.wdl_errors++;
-          if (opts.verbose) {
-            show_wdl_error(board, idx, stored, computed, lookup);
-          }
+          wdl_errors++;
+          // Note: verbose output disabled in parallel mode for thread safety
         }
       }
+
+      VerifyStats stats;
+      stats.wdl_errors = wdl_errors;
 
       std::cout << " WDL: " << (stats.wdl_errors == 0 ? "OK" : std::to_string(stats.wdl_errors) + " ERRORS")
                 << "\n";
@@ -486,34 +513,66 @@ int main(int argc, char* argv[]) {
         }
       }
 
+      // Pre-load all sub-tablebases for thread-safe parallel access
+      for (int wp = m.white_pieces(); wp >= 1; --wp) {
+        for (int bp = m.black_pieces(); bp >= 1; --bp) {
+          if (wp + bp > m.total_pieces()) continue;
+          for (int bwp = 0; bwp <= std::min(4, wp); ++bwp) {
+            for (int owp = 0; owp <= wp - bwp; ++owp) {
+              int wq = wp - bwp - owp;
+              for (int bbp = 0; bbp <= std::min(4, bp); ++bbp) {
+                for (int obp = 0; obp <= bp - bbp; ++obp) {
+                  int bq = bp - bbp - obp;
+                  Material sub{bwp, bbp, owp, obp, wq, bq};
+                  if (tables.wdl.find(sub) == tables.wdl.end()) {
+                    auto tb = load_tablebase(sub);
+                    if (!tb.empty()) tables.wdl[sub] = std::move(tb);
+                  }
+                  if (check_dtm && tables.dtm.find(sub) == tables.dtm.end()) {
+                    auto tb = load_dtm(sub);
+                    if (!tb.empty()) tables.dtm[sub] = std::move(tb);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
       std::size_t size = material_size(m);
       std::cout << "Verifying " << m << " (" << size << " positions)...";
       std::cout.flush();
 
+      // Thread-safe lookup (all tablebases pre-loaded, read-only access)
       auto lookup = [&tables](const Board& pos) -> int {
-        return tables.lookup_score(pos);
+        Material pm = get_material(pos);
+        if (pm.white_pieces() == 0) return SCORE_LOSS;
+        auto it = tables.wdl.find(pm);
+        if (it == tables.wdl.end() || it->second.empty()) return SCORE_DRAW;
+        return value_to_score(it->second[board_to_index(pos, pm)]);
       };
 
       auto get_stored = [&wdl](std::size_t idx) -> Value {
         return wdl[idx];
       };
 
-      VerifyStats stats = verify_wdl(m, size, lookup, get_stored, opts.verbose);
+      VerifyStats stats = verify_wdl(m, size, lookup, get_stored);
 
-      // DTM verification
+      // DTM verification (parallelized)
       if (check_dtm) {
+        std::size_t dtm_errors = 0;
+
+        #pragma omp parallel for reduction(+:dtm_errors) schedule(dynamic, 1024)
         for (std::size_t idx = 0; idx < size; ++idx) {
           Board board = index_to_board(idx, m);
           DTM stored_dtm = dtm[idx];
           DTM computed_dtm = compute_dtm(board, wdl[idx], tables);
 
           if (stored_dtm != computed_dtm) {
-            stats.dtm_errors++;
-            if (opts.verbose) {
-              show_dtm_error(board, idx, stored_dtm, computed_dtm, tables);
-            }
+            dtm_errors++;
           }
         }
+        stats.dtm_errors = dtm_errors;
       }
 
       std::cout << " WDL: " << (stats.wdl_errors == 0 ? "OK" : std::to_string(stats.wdl_errors) + " ERRORS");

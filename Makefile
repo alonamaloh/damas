@@ -23,7 +23,10 @@ lookup: $(OBJS) lookup.o
 	$(CXX) $(CXXFLAGS) -o $@ $^
 
 verify: $(OBJS) verify.o
-	$(CXX) $(CXXFLAGS) -o $@ $^
+	$(CXX) $(CXXFLAGS) $(OMPFLAGS) -o $@ $^
+
+verify.o: verify.cpp
+	$(CXX) $(CXXFLAGS) $(OMPFLAGS) -c -o $@ $<
 
 longest_mate: $(OBJS) longest_mate.o
 	$(CXX) $(CXXFLAGS) -o $@ $^
