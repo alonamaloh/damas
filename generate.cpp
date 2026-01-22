@@ -559,6 +559,29 @@ void solve_pair(const Material& m1, const Material& m2,
 // Thread-Safe Parallel Solvers (for OpenMP parallelization)
 // ============================================================================
 
+// Verify all dependencies are loaded, abort if any are missing
+void verify_dependencies(const Material& m,
+                         const std::vector<Material>& deps,
+                         const std::unordered_map<Material, std::vector<Value>>& loaded) {
+  std::vector<Material> missing;
+  for (const Material& dep : deps) {
+    // Skip terminal materials (one side has 0 pieces) - no tablebase needed
+    if (dep.white_pieces() == 0 || dep.black_pieces() == 0) continue;
+    if (loaded.find(dep) == loaded.end()) {
+      missing.push_back(dep);
+    }
+  }
+  if (!missing.empty()) {
+    std::cerr << "\nFATAL: Missing dependencies for " << m << ":\n";
+    for (const Material& dep : missing) {
+      std::cerr << "  " << dep << " (not generated or not on disk)\n";
+    }
+    std::cerr << "This indicates a bug in dependency scheduling or all_materials().\n";
+    std::cerr << "Aborting to prevent generating incorrect tablebase.\n";
+    std::exit(1);
+  }
+}
+
 // Thread-safe solve for a single symmetric material
 // Uses global g_wdl_tablebases and builds local copies of dependencies
 void solve_single_threadsafe(const Material& m) {
@@ -575,6 +598,9 @@ void solve_single_threadsafe(const Material& m) {
       }
     }
   }
+
+  // Fail loudly if any dependency is missing
+  verify_dependencies(m, deps, local_tablebases);
 
   auto start = std::chrono::high_resolution_clock::now();
 
@@ -612,6 +638,9 @@ void solve_pair_threadsafe(const Material& m1, const Material& m2) {
       }
     }
   }
+
+  // Fail loudly if any dependency is missing
+  verify_dependencies(m1, deps, local_tablebases);
 
   std::size_t size1 = material_size(m1);
   std::size_t size2 = material_size(m2);
@@ -897,6 +926,9 @@ void solve_dtm_single_threadsafe(const Material& m) {
     }
   }
 
+  // Fail loudly if any WDL dependency is missing
+  verify_dependencies(m, deps, local_wdl);
+
   // Load WDL for this material
   std::vector<Value> wdl = get_wdl_tablebase(m);
   if (wdl.empty()) {
@@ -962,6 +994,9 @@ void solve_dtm_pair_threadsafe(const Material& m1, const Material& m2) {
       if (!tb.empty()) local_dtm[dep] = std::move(tb);
     }
   }
+
+  // Fail loudly if any WDL dependency is missing
+  verify_dependencies(m1, deps, local_wdl);
 
   // Load WDL for both materials
   std::vector<Value> wdl1 = get_wdl_tablebase(m1);
