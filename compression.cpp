@@ -129,116 +129,80 @@ std::vector<Value> mark_dont_care_positions(
 // WDL Lookup with Search (Stage 2)
 // ============================================================================
 
-namespace {
+// Score encoding: WIN=1, DRAW=0, LOSS=-1
+// This allows standard negamax: score = -negamax(child)
+static constexpr int SCORE_WIN = 1;
+static constexpr int SCORE_DRAW = 0;
+static constexpr int SCORE_LOSS = -1;
 
-// Internal recursive search context for statistics tracking
-struct SearchContext {
-  const std::unordered_map<Material, std::vector<Value>>* sub_tablebases;
-  SearchStats* stats;
-  std::size_t current_depth;
-  std::size_t nodes_this_search;
-};
-
-// Internal recursive search through don't-care (capture) positions.
-// Since captures are irreversible, the recursion depth is bounded by
-// the number of pieces on the board.
-Value search_wdl_internal(
-    const Board& b,
-    const std::vector<Value>& tablebase,
-    const Material& m,
-    SearchContext& ctx);
-
-// Look up value, recursing into sub-tablebases if material changes
-Value lookup_value(
-    const Board& b,
-    const std::vector<Value>& tablebase,
-    const Material& m,
-    SearchContext& ctx) {
-
-  ctx.nodes_this_search++;
-  ctx.current_depth++;
-  if (ctx.stats && ctx.current_depth > ctx.stats->max_depth) {
-    ctx.stats->max_depth = ctx.current_depth;
+static inline int value_to_score(Value v) {
+  switch (v) {
+    case Value::WIN: return SCORE_WIN;
+    case Value::DRAW: return SCORE_DRAW;
+    case Value::LOSS: return SCORE_LOSS;
+    default: return SCORE_DRAW;  // Treat UNKNOWN conservatively as draw
   }
-
-  Material board_m = get_material(b);
-
-  // Material changed - look up in sub-tablebase
-  if (!(board_m == m)) {
-    ctx.current_depth--;
-    if (!ctx.sub_tablebases) {
-      return Value::DRAW;  // Conservative
-    }
-    auto it = ctx.sub_tablebases->find(board_m);
-    if (it == ctx.sub_tablebases->end() || it->second.empty()) {
-      return Value::DRAW;  // Conservative
-    }
-    if (ctx.stats) ctx.stats->sub_tb_lookups++;
-    return search_wdl_internal(b, it->second, board_m, ctx);
-  }
-
-  // Same material - direct lookup
-  std::size_t idx = board_to_index(b, m);
-  Value stored = tablebase[idx];
-
-  if (stored != Value::UNKNOWN) {
-    ctx.current_depth--;
-    return stored;
-  }
-
-  // Don't-care position: search
-  Value result = search_wdl_internal(b, tablebase, m, ctx);
-  ctx.current_depth--;
-  return result;
 }
 
-// Minimax search through capture positions
-Value search_wdl_internal(
-    const Board& b,
-    const std::vector<Value>& tablebase,
-    const Material& m,
-    SearchContext& ctx) {
+static inline Value score_to_value(int score) {
+  if (score > 0) return Value::WIN;
+  if (score < 0) return Value::LOSS;
+  return Value::DRAW;
+}
 
+// Negamax search with alpha-beta pruning through don't-care positions.
+// The Lookup callable returns an int score for quiet positions.
+// Template to allow different lookup strategies (uncompressed, compressed, manager).
+template<typename Lookup>
+static int negamax(const Board& b, int alpha, int beta, Lookup&& lookup) {
+  // Quiet position: use the lookup function
+  if (!has_captures(b)) {
+    return lookup(b);
+  }
+
+  // Capture position: search through forced moves
   std::vector<Move> moves;
   generateMoves(b, moves);
 
   if (moves.empty()) {
-    return Value::LOSS;
+    return SCORE_LOSS;
   }
-
-  bool has_draw = false;
 
   for (const Move& move : moves) {
     Board next = makeMove(b, move);
 
     // Terminal: captured all opponent pieces
     if (next.white == 0) {
-      if (ctx.stats) ctx.stats->terminal_wins++;
-      return Value::WIN;
+      return SCORE_WIN;
     }
 
-    Value val = lookup_value(next, tablebase, flip(m), ctx);
+    int score = -negamax(next, -beta, -alpha, lookup);
 
-    if (val == Value::LOSS) {
-      return Value::WIN;
+    if (score >= beta) {
+      return score;  // Beta cutoff
     }
-    if (val == Value::DRAW) {
-      has_draw = true;
-    }
+    alpha = std::max(alpha, score);
   }
 
-  return has_draw ? Value::DRAW : Value::LOSS;
+  return alpha;
 }
-
-} // anonymous namespace
 
 Value lookup_wdl_with_search(
     const Board& b,
     const std::vector<Value>& tablebase,
     const Material& m) {
 
-  SearchContext ctx{nullptr, nullptr, 0, 0};
-  return lookup_value(b, tablebase, m, ctx);
+  auto lookup = [&](const Board& pos) -> int {
+    Material pos_m = get_material(pos);
+    if (!(pos_m == m)) {
+      return SCORE_DRAW;  // Material changed, no sub-tablebase - conservative
+    }
+    std::size_t idx = board_to_index(pos, m);
+    return value_to_score(tablebase[idx]);
+  };
+
+  int score = negamax(b, SCORE_LOSS, SCORE_WIN, lookup);
+  return score_to_value(score);
 }
 
 Value lookup_wdl_with_search(
@@ -251,9 +215,9 @@ Value lookup_wdl_with_search(
   if (stats) stats->lookups++;
 
   // Check if it's a direct hit (not don't-care)
-  std::size_t idx = board_to_index(b, m);
-  Value stored = tablebase[idx];
-  if (stored != Value::UNKNOWN) {
+  if (!has_captures(b)) {
+    std::size_t idx = board_to_index(b, m);
+    Value stored = tablebase[idx];
     if (stats) stats->direct_hits++;
     return stored;
   }
@@ -261,11 +225,29 @@ Value lookup_wdl_with_search(
   // Need to search
   if (stats) stats->searches++;
 
-  SearchContext ctx{&sub_tablebases, stats, 0, 0};
-  Value result = search_wdl_internal(b, tablebase, m, ctx);
+  auto lookup = [&](const Board& pos) -> int {
+    if (stats) stats->total_nodes++;
 
-  if (stats) stats->total_nodes += ctx.nodes_this_search;
-  return result;
+    Material pos_m = get_material(pos);
+
+    // Material changed - look up in sub-tablebase
+    if (!(pos_m == m)) {
+      if (stats) stats->sub_tb_lookups++;
+      auto it = sub_tablebases.find(pos_m);
+      if (it == sub_tablebases.end() || it->second.empty()) {
+        return SCORE_DRAW;  // Conservative
+      }
+      // Recurse into sub-tablebase
+      std::size_t idx = board_to_index(pos, pos_m);
+      return value_to_score(it->second[idx]);
+    }
+
+    std::size_t idx = board_to_index(pos, m);
+    return value_to_score(tablebase[idx]);
+  };
+
+  int score = negamax(b, SCORE_LOSS, SCORE_WIN, lookup);
+  return score_to_value(score);
 }
 
 // ============================================================================
@@ -786,50 +768,18 @@ Value lookup_compressed_with_search(
     const Board& b,
     const CompressedTablebase& tb) {
 
-  // Quiet position: direct lookup
-  if (!has_captures(b)) {
-    std::size_t idx = board_to_index(b, tb.material);
-    return lookup_compressed(tb, idx);
-  }
-
-  // Capture position: minimax search
-  std::vector<Move> moves;
-  generateMoves(b, moves);
-
-  if (moves.empty()) {
-    return Value::LOSS;
-  }
-
-  bool has_draw = false;
-
-  for (const Move& move : moves) {
-    Board next = makeMove(b, move);
-
-    // Terminal: captured all opponent pieces
-    if (next.white == 0) {
-      return Value::WIN;
-    }
-
-    // Check if material changed (sub-tablebase needed)
-    Material next_m = get_material(next);
-    if (!(next_m == flip(tb.material))) {
+  auto lookup = [&](const Board& pos) -> int {
+    Material pos_m = get_material(pos);
+    if (!(pos_m == tb.material)) {
       // Material changed - would need sub-tablebase lookup
-      // Conservatively treat as draw
-      has_draw = true;
-      continue;
+      return SCORE_DRAW;  // Conservative
     }
+    std::size_t idx = board_to_index(pos, tb.material);
+    return value_to_score(lookup_compressed(tb, idx));
+  };
 
-    Value val = lookup_compressed_with_search(next, tb);
-
-    if (val == Value::LOSS) {
-      return Value::WIN;
-    }
-    if (val == Value::DRAW) {
-      has_draw = true;
-    }
-  }
-
-  return has_draw ? Value::DRAW : Value::LOSS;
+  int score = negamax(b, SCORE_LOSS, SCORE_WIN, lookup);
+  return score_to_value(score);
 }
 
 // ============================================================================
@@ -2063,39 +2013,16 @@ Value CompressedTablebaseManager::lookup_wdl(const Board& b) {
     return Value::UNKNOWN;
   }
 
-  // Quiet position: direct lookup
-  if (!has_captures(b)) {
-    return lookup_compressed(*tb, board_to_index(b, m));
-  }
-
-  // Capture position: minimax search
-  std::vector<Move> moves;
-  generateMoves(b, moves);
-  if (moves.empty()) {
-    return Value::LOSS;
-  }
-
-  bool has_draw = false;
-  for (const Move& move : moves) {
-    Board next = makeMove(b, move);
-
-    // Terminal: captured all opponent pieces
-    if (next.white == 0) {
-      return Value::WIN;
+  auto lookup = [this](const Board& pos) -> int {
+    Material pos_m = get_material(pos);
+    CompressedTablebase* pos_tb = load_or_get(pos_m, false);
+    if (!pos_tb) {
+      return SCORE_DRAW;  // Missing tablebase - conservative
     }
+    std::size_t idx = board_to_index(pos, pos_m);
+    return value_to_score(lookup_compressed(*pos_tb, idx));
+  };
 
-    Value val = lookup_wdl(next);
-    if (val == Value::LOSS) {
-      return Value::WIN;  // Found a winning move
-    }
-    if (val == Value::DRAW) {
-      has_draw = true;
-    }
-    if (val == Value::UNKNOWN) {
-      // Tablebase missing for this material - treat conservatively as draw
-      has_draw = true;
-    }
-  }
-
-  return has_draw ? Value::DRAW : Value::LOSS;
+  int score = negamax(b, SCORE_LOSS, SCORE_WIN, lookup);
+  return score_to_value(score);
 }
