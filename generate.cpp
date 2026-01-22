@@ -149,8 +149,192 @@ std::vector<Material> promotion_targets(const Material& m) {
   return result;
 }
 
-// Generate tablebase for a single material configuration
-// Requires all sub-tablebases (reachable by captures/promotions) to be loaded
+// ============================================================================
+// Position-Level Parallel Tablebase Generation
+// ============================================================================
+//
+// Uses OpenMP to parallelize the loop over positions within a single material.
+// This avoids dependency bottlenecks where large materials block other work.
+//
+// Algorithm: Level-synchronized iteration
+//   1. Initialize: mark terminals (no moves = LOSS), immediate wins
+//   2. Iterate: for each UNKNOWN, check successors. WIN if any LOSS, LOSS if all WIN.
+//   3. Repeat until no changes
+//   4. Remaining UNKNOWNs are DRAWs
+
+// Compute value for a single position given current table states
+// Returns UNKNOWN if not yet determinable
+Value compute_position_value(
+    std::size_t idx,
+    const Material& m,
+    const std::vector<Value>& table_m,      // Current material's table
+    const std::vector<Value>& table_fm,     // flip(m)'s table (empty if symmetric)
+    const std::unordered_map<Material, std::vector<Value>>& deps) {
+
+  Board board = index_to_board(idx, m);
+  std::vector<Move> moves;
+  generateMoves(board, moves);
+
+  if (moves.empty()) return Value::LOSS;
+
+  Material fm = flip(m);
+  bool symmetric = (m == fm);
+
+  bool found_loss = false;      // Found a successor that's LOSS (we can WIN)
+  bool has_draw = false;        // Found a successor that's DRAW
+  bool has_unknown = false;     // Found a successor that's UNKNOWN
+  std::size_t num_wins = 0;     // Count of successors that are WIN
+
+  for (const Move& move : moves) {
+    Board next = makeMove(board, move);
+    Material next_m = get_material(next);
+
+    Value succ_val = Value::UNKNOWN;
+
+    // Terminal capture (opponent eliminated)
+    if (next_m.white_pieces() == 0) {
+      succ_val = Value::LOSS;  // Opponent loses
+    } else if (next_m.black_pieces() == 0) {
+      succ_val = Value::WIN;   // Shouldn't happen, but treat as bad
+    } else if (next_m == fm) {
+      // Quiet move: lookup in flip(m)'s table
+      std::size_t next_idx = board_to_index(next, fm);
+      if (symmetric) {
+        succ_val = table_m[next_idx];
+      } else {
+        succ_val = table_fm[next_idx];
+      }
+    } else {
+      // Material-changing move: lookup in dependency tablebase
+      auto it = deps.find(next_m);
+      if (it != deps.end() && !it->second.empty()) {
+        std::size_t next_idx = board_to_index(next, next_m);
+        if (next_idx < it->second.size()) {
+          succ_val = it->second[next_idx];
+        }
+      }
+    }
+
+    if (succ_val == Value::LOSS) {
+      found_loss = true;  // We can win by moving here
+    } else if (succ_val == Value::WIN) {
+      num_wins++;
+    } else if (succ_val == Value::DRAW) {
+      has_draw = true;
+    } else {
+      has_unknown = true;
+    }
+  }
+
+  // Determine our value
+  if (found_loss) {
+    return Value::WIN;
+  }
+  if (num_wins == moves.size()) {
+    return Value::LOSS;  // All successors are wins for opponent
+  }
+  if (!has_unknown && has_draw) {
+    return Value::DRAW;  // No unknowns left, we have a draw escape
+  }
+  if (!has_unknown) {
+    return Value::DRAW;  // No unknowns, no losses found, not all wins = draw
+  }
+
+  return Value::UNKNOWN;  // Still undetermined
+}
+
+// Generate tablebase(s) for material M (and flip(M) if different)
+// Uses position-level parallelism with level-synchronized iteration
+void generate_wdl_parallel(
+    const Material& m,
+    const std::unordered_map<Material, std::vector<Value>>& deps) {
+
+  Material fm = flip(m);
+  bool symmetric = (m == fm);
+
+  std::size_t size_m = material_size(m);
+  std::size_t size_fm = symmetric ? 0 : material_size(fm);
+
+  std::vector<Value> table_m(size_m, Value::UNKNOWN);
+  std::vector<Value> table_fm(size_fm, Value::UNKNOWN);
+
+  auto start = std::chrono::high_resolution_clock::now();
+
+  // Iterate until stable
+  int iteration = 0;
+  bool changed = true;
+
+  while (changed) {
+    changed = false;
+    iteration++;
+
+    // Update table_m in parallel
+    #pragma omp parallel for schedule(dynamic, 1024) reduction(||:changed)
+    for (std::size_t idx = 0; idx < size_m; ++idx) {
+      if (table_m[idx] != Value::UNKNOWN) continue;
+
+      Value new_val = compute_position_value(idx, m, table_m, table_fm, deps);
+      if (new_val != Value::UNKNOWN) {
+        table_m[idx] = new_val;
+        changed = true;
+      }
+    }
+
+    if (!symmetric) {
+      // Update table_fm in parallel
+      #pragma omp parallel for schedule(dynamic, 1024) reduction(||:changed)
+      for (std::size_t idx = 0; idx < size_fm; ++idx) {
+        if (table_fm[idx] != Value::UNKNOWN) continue;
+
+        Value new_val = compute_position_value(idx, fm, table_fm, table_m, deps);
+        if (new_val != Value::UNKNOWN) {
+          table_fm[idx] = new_val;
+          changed = true;
+        }
+      }
+    }
+  }
+
+  // Mark remaining as DRAW
+  std::size_t wins_m = 0, losses_m = 0, draws_m = 0;
+  #pragma omp parallel for reduction(+:wins_m,losses_m,draws_m)
+  for (std::size_t idx = 0; idx < size_m; ++idx) {
+    if (table_m[idx] == Value::UNKNOWN) table_m[idx] = Value::DRAW;
+    if (table_m[idx] == Value::WIN) wins_m++;
+    else if (table_m[idx] == Value::LOSS) losses_m++;
+    else draws_m++;
+  }
+
+  auto end = std::chrono::high_resolution_clock::now();
+  auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
+  std::cout << m << " (" << size_m << " pos): "
+            << wins_m << "W/" << losses_m << "L/" << draws_m << "D, "
+            << iteration << " iters, " << duration.count() << "ms" << std::endl;
+
+  save_tablebase(table_m, m);
+  store_wdl_tablebase(m, std::move(table_m));
+
+  if (!symmetric) {
+    std::size_t wins_fm = 0, losses_fm = 0, draws_fm = 0;
+    #pragma omp parallel for reduction(+:wins_fm,losses_fm,draws_fm)
+    for (std::size_t idx = 0; idx < size_fm; ++idx) {
+      if (table_fm[idx] == Value::UNKNOWN) table_fm[idx] = Value::DRAW;
+      if (table_fm[idx] == Value::WIN) wins_fm++;
+      else if (table_fm[idx] == Value::LOSS) losses_fm++;
+      else draws_fm++;
+    }
+
+    std::cout << fm << " (" << size_fm << " pos): "
+              << wins_fm << "W/" << losses_fm << "L/" << draws_fm << "D" << std::endl;
+
+    save_tablebase(table_fm, fm);
+    store_wdl_tablebase(fm, std::move(table_fm));
+  }
+}
+
+// Legacy single-threaded generate for compatibility
+// (Used by solve_pair which needs iterative refinement)
 std::vector<Value> generate_tablebase(
     const Material& m,
     const std::unordered_map<Material, std::vector<Value>>& sub_tablebases,
@@ -158,202 +342,43 @@ std::vector<Value> generate_tablebase(
 
   std::size_t size = material_size(m);
   stats.total_positions = size;
+  Material fm = flip(m);
 
   std::vector<Value> table(size, Value::UNKNOWN);
-  std::vector<Move> moves;
 
-  // Count remaining unknown positions for each index (for LOSS detection)
-  // A position is LOSS if ALL successors are WIN for opponent
-  std::vector<std::uint16_t> unknown_successor_count(size, 0);
-
-  // Track positions with external draw escapes (material-changing moves to DRAW)
-  // If a position has an external draw escape, it can't be LOSS even if all
-  // internal successors are WIN for opponent
-  std::vector<bool> has_external_draw(size, false);
-
-  // Predecessor lists for backward propagation
-  // predecessors[i] = list of (predecessor_index) that lead to position i
-  std::vector<std::vector<std::size_t>> predecessors(size);
-
-  // Phase 1: Initialize terminal positions and build predecessor graph
-  for (std::size_t idx = 0; idx < size; ++idx) {
-    Board board = index_to_board(idx, m);
-
-    // Generate moves from this position
-    generateMoves(board, moves);
-
-    if (moves.empty()) {
-      // No moves = side to move loses
-      table[idx] = Value::LOSS;
-      stats.losses++;
-      continue;
-    }
-
-    bool position_has_captures = has_captures(board);
-    if (position_has_captures) {
-      stats.with_captures++;
-    }
-
-    // Check successors
-    std::size_t successor_count = 0;
-    std::size_t bad_successors = 0;  // Successors where opponent wins
-    bool found_win = false;
-
-    for (const Move& move : moves) {
-      Board next = makeMove(board, move);
-
-      // After makeMove, board is flipped (opponent's turn)
-      Material next_m = get_material(next);
-
-      // Check if material changed (capture or promotion)
-      bool material_changed = !(next_m == flip(m));
-
-      if (material_changed) {
-        // Check for terminal positions first (one side eliminated)
-        if (next_m.white_pieces() == 0) {
-          // After flip, opponent (original us) has 0 pieces = we captured everything
-          // Opponent loses immediately = we win!
-          found_win = true;
-        } else if (next_m.black_pieces() == 0) {
-          // After flip, we (original opponent) have 0 pieces = shouldn't happen
-          // This would mean we captured our own pieces, which is impossible
-          bad_successors++;
-        } else {
-          // Lookup in sub-tablebase (from opponent's perspective)
-          // After flip in makeMove, 'next' has opponent as "white" (to move)
-          // We lookup from their perspective
-          auto it = sub_tablebases.find(next_m);
-          if (it != sub_tablebases.end() && !it->second.empty()) {
-          // Verify material matches before indexing
-          Material verify_m = get_material(next);
-          if (verify_m == next_m) {
-            std::size_t tb_size = it->second.size();
-            std::size_t expected_size = material_size(next_m);
-            if (tb_size == expected_size) {
-              std::size_t next_idx = board_to_index(next, next_m);
-              if (next_idx < tb_size) {
-                Value sub_val = it->second[next_idx];
-                if (sub_val == Value::LOSS) {
-                  // Opponent (to move next) loses -> we win!
-                  found_win = true;
-                } else if (sub_val == Value::WIN) {
-                  // Opponent wins -> this successor is bad for us
-                  bad_successors++;
-                } else if (sub_val == Value::DRAW) {
-                  // External draw escape - can't be LOSS even if all internal moves are bad
-                  has_external_draw[idx] = true;
-                }
-                // UNKNOWN doesn't resolve the position yet
-              }
-            }
-          }
-        }
-        }
-      } else {
-        // Quiet move - material stays same after flip
-        // If M == flip(M), we can use predecessor links for efficient propagation
-        // Otherwise, we need to treat this as a sub-tablebase lookup
-        Material flipped_m = flip(m);
-        if (m == flipped_m) {
-          // Self-symmetric material - build predecessor link
-          std::size_t next_idx = board_to_index(next, m);
-          if (next_idx < size) {
-            predecessors[next_idx].push_back(idx);
-            successor_count++;
-          }
-        } else {
-          // Non-symmetric material - lookup in flip(M)'s tablebase
-          auto it = sub_tablebases.find(flipped_m);
-          if (it != sub_tablebases.end() && !it->second.empty()) {
-            std::size_t next_idx = board_to_index(next, flipped_m);
-            if (next_idx < it->second.size()) {
-              Value sub_val = it->second[next_idx];
-              if (sub_val == Value::LOSS) {
-                found_win = true;
-              } else if (sub_val == Value::WIN) {
-                bad_successors++;
-              } else if (sub_val == Value::DRAW) {
-                // External draw escape
-                has_external_draw[idx] = true;
-              }
-            }
-          }
-        }
-      }
-    }
-
-    if (found_win) {
-      table[idx] = Value::WIN;
-      stats.wins++;
-    } else if (bad_successors == moves.size()) {
-      // All moves lead to opponent WIN -> we lose
-      table[idx] = Value::LOSS;
-      stats.losses++;
-    } else if (successor_count == 0) {
-      // No unknown successors and no wins -> must be all draws/unknown from sub-tables
-      // For non-symmetric materials, this means DRAW
-      table[idx] = Value::DRAW;
-      stats.draws++;
-    } else {
-      // Some successors need propagation (only for self-symmetric materials)
-      unknown_successor_count[idx] = successor_count;
+  // Get flip(m)'s table if available (for non-symmetric materials)
+  std::vector<Value> table_fm;
+  if (!(m == fm)) {
+    auto it = sub_tablebases.find(fm);
+    if (it != sub_tablebases.end()) {
+      table_fm = it->second;
     }
   }
 
-  // Phase 2: Propagate using work queue
-  std::queue<std::size_t> work_queue;
+  // Iterate until stable
+  bool changed = true;
+  while (changed) {
+    changed = false;
 
-  // Initialize work queue with known losses (positions where opponent is to move
-  // and can reach us means we might be a WIN)
-  for (std::size_t idx = 0; idx < size; ++idx) {
-    if (table[idx] == Value::LOSS || table[idx] == Value::WIN) {
-      work_queue.push(idx);
-    }
-  }
+    for (std::size_t idx = 0; idx < size; ++idx) {
+      if (table[idx] != Value::UNKNOWN) continue;
 
-  while (!work_queue.empty()) {
-    std::size_t idx = work_queue.front();
-    work_queue.pop();
-
-    Value val = table[idx];
-    if (val != Value::WIN && val != Value::LOSS) continue;
-
-    // Propagate to predecessors
-    for (std::size_t pred_idx : predecessors[idx]) {
-      if (table[pred_idx] != Value::UNKNOWN) continue;
-
-      if (val == Value::LOSS) {
-        // Successor is LOSS for opponent -> we WIN
-        table[pred_idx] = Value::WIN;
-        stats.wins++;
-        work_queue.push(pred_idx);
-      } else {  // val == Value::WIN
-        // Successor is WIN for opponent -> one fewer good option for us
-        unknown_successor_count[pred_idx]--;
-        if (unknown_successor_count[pred_idx] == 0) {
-          // All internal successors are wins for opponent
-          if (has_external_draw[pred_idx]) {
-            // But we have an external draw escape -> DRAW
-            table[pred_idx] = Value::DRAW;
-            stats.draws++;
-            // Don't push to work queue - DRAW doesn't propagate
-          } else {
-            // No escape -> we LOSE
-            table[pred_idx] = Value::LOSS;
-            stats.losses++;
-            work_queue.push(pred_idx);
-          }
-        }
+      Value new_val = compute_position_value(idx, m, table, table_fm, sub_tablebases);
+      if (new_val != Value::UNKNOWN) {
+        table[idx] = new_val;
+        changed = true;
       }
     }
   }
 
-  // Phase 3: Remaining UNKNOWN positions are DRAWs
+  // Count and mark remaining as DRAW
   for (std::size_t idx = 0; idx < size; ++idx) {
     if (table[idx] == Value::UNKNOWN) {
       table[idx] = Value::DRAW;
-      stats.draws++;
     }
+    if (table[idx] == Value::WIN) stats.wins++;
+    else if (table[idx] == Value::LOSS) stats.losses++;
+    else stats.draws++;
   }
 
   return table;
@@ -582,157 +607,24 @@ void verify_dependencies(const Material& m,
   }
 }
 
-// Thread-safe solve for a single symmetric material
-// Uses global g_wdl_tablebases and builds local copies of dependencies
-void solve_single_threadsafe(const Material& m) {
-  // Build local sub_tablebases from all reachable materials (for multi-captures)
-  std::vector<Material> deps = get_sub_materials(m);
-  std::unordered_map<Material, std::vector<Value>> local_tablebases = build_local_wdl_tablebases(deps);
-
-  // Also load from disk if not in memory
-  for (const Material& dep : deps) {
-    if (local_tablebases.find(dep) == local_tablebases.end()) {
-      std::vector<Value> tb = load_tablebase(dep);
-      if (!tb.empty()) {
-        local_tablebases[dep] = std::move(tb);
-      }
-    }
-  }
-
-  // Fail loudly if any dependency is missing
-  verify_dependencies(m, deps, local_tablebases);
-
-  auto start = std::chrono::high_resolution_clock::now();
-
-  Stats stats;
-  std::vector<Value> table = generate_tablebase(m, local_tablebases, stats);
-
-  auto end = std::chrono::high_resolution_clock::now();
-  auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-
-  // Thread-safe output
-  #pragma omp critical
-  {
-    std::cout << "[Thread " << omp_get_thread_num() << "] " << m
-              << " (" << material_size(m) << " pos): "
-              << stats.wins << "W/" << stats.losses << "L/" << stats.draws << "D in "
-              << duration.count() << "ms" << std::endl;
-  }
-
-  save_tablebase(table, m);
-  store_wdl_tablebase(m, std::move(table));
-}
-
-// Thread-safe solve for a pair of mutually-dependent materials
-void solve_pair_threadsafe(const Material& m1, const Material& m2) {
-  // Build local sub_tablebases from all reachable materials (for multi-captures)
-  std::vector<Material> deps = get_sub_materials(m1);  // Same as m2's deps
-  std::unordered_map<Material, std::vector<Value>> local_tablebases = build_local_wdl_tablebases(deps);
-
-  // Also load from disk if not in memory
-  for (const Material& dep : deps) {
-    if (local_tablebases.find(dep) == local_tablebases.end()) {
-      std::vector<Value> tb = load_tablebase(dep);
-      if (!tb.empty()) {
-        local_tablebases[dep] = std::move(tb);
-      }
-    }
-  }
-
-  // Fail loudly if any dependency is missing
-  verify_dependencies(m1, deps, local_tablebases);
-
-  std::size_t size1 = material_size(m1);
-  std::size_t size2 = material_size(m2);
-
-  // Initialize both tables
-  std::vector<Value> table1(size1, Value::DRAW);
-  std::vector<Value> table2(size2, Value::DRAW);
-
-  local_tablebases[m1] = table1;
-  local_tablebases[m2] = table2;
-
-  auto start = std::chrono::high_resolution_clock::now();
-
-  // Iterate until stable
-  bool changed = true;
-  int iteration = 0;
-  while (changed && iteration < 100) {
-    changed = false;
-    iteration++;
-
-    Stats stats1;
-    std::vector<Value> new_table1 = generate_tablebase(m1, local_tablebases, stats1);
-    for (std::size_t i = 0; i < size1; ++i) {
-      if (table1[i] != new_table1[i]) {
-        changed = true;
-        table1[i] = new_table1[i];
-      }
-    }
-    local_tablebases[m1] = table1;
-
-    Stats stats2;
-    std::vector<Value> new_table2 = generate_tablebase(m2, local_tablebases, stats2);
-    for (std::size_t i = 0; i < size2; ++i) {
-      if (table2[i] != new_table2[i]) {
-        changed = true;
-        table2[i] = new_table2[i];
-      }
-    }
-    local_tablebases[m2] = table2;
-  }
-
-  auto end = std::chrono::high_resolution_clock::now();
-  auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-
-  // Count statistics
-  std::size_t wins1 = 0, losses1 = 0, draws1 = 0;
-  for (Value v : table1) {
-    if (v == Value::WIN) wins1++;
-    else if (v == Value::LOSS) losses1++;
-    else draws1++;
-  }
-  std::size_t wins2 = 0, losses2 = 0, draws2 = 0;
-  for (Value v : table2) {
-    if (v == Value::WIN) wins2++;
-    else if (v == Value::LOSS) losses2++;
-    else draws2++;
-  }
-
-  #pragma omp critical
-  {
-    std::cout << "[Thread " << omp_get_thread_num() << "] Pair " << m1 << " <-> " << m2
-              << " (" << iteration << " iters, " << duration.count() << "ms):" << std::endl;
-    std::cout << "    " << m1 << ": " << wins1 << "W/" << losses1 << "L/" << draws1 << "D" << std::endl;
-    std::cout << "    " << m2 << ": " << wins2 << "W/" << losses2 << "L/" << draws2 << "D" << std::endl;
-  }
-
-  save_tablebase(table1, m1);
-  save_tablebase(table2, m2);
-  store_wdl_tablebase(m1, std::move(table1));
-  store_wdl_tablebase(m2, std::move(table2));
-}
-
-// Solve all materials up to max_pieces in parallel using dependency graph
-// A material can start processing as soon as all its actual dependencies are done,
-// not when all materials at a "lower level" are done.
+// Solve all materials up to max_pieces using position-level parallelism
+// Materials are processed sequentially in dependency order, but each material
+// uses all available cores for parallel position processing.
 // If load_existing is true, try to load tablebases from disk instead of generating.
 void solve_all_parallel(int max_pieces, bool load_existing = false) {
   std::vector<Material> all = all_materials(max_pieces);
 
   std::cout << "=== Parallel Tablebase Generation ===" << std::endl;
-  std::cout << "Using " << omp_get_max_threads() << " threads" << std::endl;
+  std::cout << "Using " << omp_get_max_threads() << " threads (position-level parallelism)" << std::endl;
   if (load_existing) {
     std::cout << "Mode: Load existing tablebases from disk when available" << std::endl;
   }
   std::cout << "Total materials: " << all.size() << std::endl;
 
   // Canonicalize materials: for asymmetric pairs, pick one representative
-  // Map each material to its canonical form
   std::unordered_map<Material, Material> canonical;
   std::unordered_set<Material> canonical_set;
 
-  // Helper to pick canonical representative (lexicographic on fields)
   auto material_less = [](const Material& a, const Material& b) {
     if (a.back_white_pawns != b.back_white_pawns) return a.back_white_pawns < b.back_white_pawns;
     if (a.back_black_pawns != b.back_black_pawns) return a.back_black_pawns < b.back_black_pawns;
@@ -745,7 +637,6 @@ void solve_all_parallel(int max_pieces, bool load_existing = false) {
   for (const Material& m : all) {
     Material f = flip(m);
     if (canonical.find(m) == canonical.end()) {
-      // Use smaller material as canonical (arbitrary but consistent)
       Material c = material_less(m, f) ? m : f;
       canonical[m] = c;
       canonical[f] = c;
@@ -754,152 +645,103 @@ void solve_all_parallel(int max_pieces, bool load_existing = false) {
   }
 
   std::vector<Material> work_units(canonical_set.begin(), canonical_set.end());
-  std::cout << "Work units (canonical materials): " << work_units.size() << std::endl << std::endl;
+  std::cout << "Work units (canonical materials): " << work_units.size() << std::endl;
 
-  // Build dependency graph: for each work unit, which work units must complete first?
-  std::unordered_map<Material, std::vector<Material>> dependents;  // m -> list of materials that depend on m
-  std::unordered_map<Material, int> dep_count;  // m -> number of unresolved dependencies
-
-  for (const Material& m : work_units) {
-    dep_count[m] = 0;
-  }
+  // Build dependency graph
+  std::unordered_map<Material, std::unordered_set<Material>> deps_map;
+  std::unordered_map<Material, int> dep_count;
 
   for (const Material& m : work_units) {
-    // Get dependencies for both m and flip(m)
     std::vector<Material> deps = get_dependencies(m);
     std::unordered_set<Material> canonical_deps;
-
     for (const Material& dep : deps) {
       Material c = canonical[dep];
-      if (c != m && canonical_set.find(c) != canonical_set.end()) {
+      if (!(c == m) && canonical_set.find(c) != canonical_set.end()) {
         canonical_deps.insert(c);
       }
     }
-
+    deps_map[m] = canonical_deps;
     dep_count[m] = canonical_deps.size();
-    for (const Material& dep : canonical_deps) {
-      dependents[dep].push_back(m);
-    }
   }
 
-  // Initialize terminal materials and work queue
-  std::queue<Material> ready_queue;
-  std::mutex queue_mutex;
-  std::condition_variable queue_cv;
-  int remaining = work_units.size();
-  bool done = false;
+  // Topological sort using Kahn's algorithm
+  std::vector<Material> sorted;
+  std::queue<Material> ready;
 
   for (const Material& m : work_units) {
-    // Handle terminal materials immediately
-    if (m.white_pieces() == 0 || m.black_pieces() == 0) {
-      std::size_t size = material_size(m);
-      if (size > 0) {
-        Value terminal_val = (m.white_pieces() == 0) ? Value::LOSS : Value::WIN;
-        std::vector<Value> table(size, terminal_val);
-        store_wdl_tablebase(m, std::move(table));
-      }
-      // Also store flipped version
-      Material f = flip(m);
-      if (!(f == m)) {
-        std::size_t fsize = material_size(f);
-        if (fsize > 0) {
-          Value terminal_val = (f.white_pieces() == 0) ? Value::LOSS : Value::WIN;
-          std::vector<Value> table(fsize, terminal_val);
-          store_wdl_tablebase(f, std::move(table));
-        }
-      }
-      // Mark complete and update dependents
-      {
-        std::lock_guard<std::mutex> lock(queue_mutex);
-        remaining--;
-        for (const Material& dep_m : dependents[m]) {
-          dep_count[dep_m]--;
-          if (dep_count[dep_m] == 0) {
-            ready_queue.push(dep_m);
-          }
-        }
-      }
-    } else if (dep_count[m] == 0) {
-      ready_queue.push(m);
+    if (dep_count[m] == 0) {
+      ready.push(m);
     }
   }
+
+  while (!ready.empty()) {
+    Material m = ready.front();
+    ready.pop();
+    sorted.push_back(m);
+
+    for (const Material& other : work_units) {
+      if (deps_map[other].count(m)) {
+        dep_count[other]--;
+        if (dep_count[other] == 0) {
+          ready.push(other);
+        }
+      }
+    }
+  }
+
+  if (sorted.size() != work_units.size()) {
+    std::cerr << "ERROR: Dependency cycle detected!" << std::endl;
+    return;
+  }
+
+  std::cout << std::endl;
 
   auto total_start = std::chrono::high_resolution_clock::now();
 
-  // Worker function
-  auto worker = [&]() {
-    while (true) {
-      Material m;
-      {
-        std::unique_lock<std::mutex> lock(queue_mutex);
-        queue_cv.wait(lock, [&]() { return !ready_queue.empty() || done; });
-        if (done && ready_queue.empty()) return;
-        if (ready_queue.empty()) continue;
-        m = ready_queue.front();
-        ready_queue.pop();
-      }
+  // Process materials in dependency order
+  for (const Material& m : sorted) {
+    Material f = flip(m);
 
-      // Process this material
-      Material f = flip(m);
-      bool loaded_from_disk = false;
-
-      if (load_existing) {
-        // Try to load from disk
-        std::vector<Value> tb_m = load_tablebase(m);
-        if (!tb_m.empty()) {
-          store_wdl_tablebase(m, std::move(tb_m));
-          if (!(f == m)) {
-            std::vector<Value> tb_f = load_tablebase(f);
-            if (!tb_f.empty()) {
-              store_wdl_tablebase(f, std::move(tb_f));
-              loaded_from_disk = true;
-              #pragma omp critical
-              std::cout << "[Thread " << omp_get_thread_num() << "] Loaded " << m << " <-> " << f << " from disk" << std::endl;
-            }
-          } else {
-            loaded_from_disk = true;
-            #pragma omp critical
-            std::cout << "[Thread " << omp_get_thread_num() << "] Loaded " << m << " from disk" << std::endl;
+    // Try to load from disk if requested
+    if (load_existing) {
+      std::vector<Value> tb_m = load_tablebase(m);
+      if (!tb_m.empty()) {
+        store_wdl_tablebase(m, std::move(tb_m));
+        if (!(f == m)) {
+          std::vector<Value> tb_f = load_tablebase(f);
+          if (!tb_f.empty()) {
+            store_wdl_tablebase(f, std::move(tb_f));
           }
         }
-      }
-
-      if (!loaded_from_disk) {
-        if (m == f) {
-          solve_single_threadsafe(m);
-        } else {
-          solve_pair_threadsafe(m, f);
-        }
-      }
-
-      // Update dependents
-      {
-        std::lock_guard<std::mutex> lock(queue_mutex);
-        remaining--;
-        for (const Material& dep_m : dependents[m]) {
-          dep_count[dep_m]--;
-          if (dep_count[dep_m] == 0) {
-            ready_queue.push(dep_m);
-          }
-        }
-        if (remaining == 0) {
-          done = true;
-        }
-        queue_cv.notify_all();
+        std::cout << "Loaded " << m;
+        if (!(f == m)) std::cout << " <-> " << f;
+        std::cout << " from disk" << std::endl;
+        continue;
       }
     }
-  };
 
-  // Launch worker threads
-  int num_threads = omp_get_max_threads();
-  std::vector<std::thread> threads;
-  for (int i = 0; i < num_threads; ++i) {
-    threads.emplace_back(worker);
-  }
+    // Build dependency tablebases for this material
+    std::vector<Material> deps = get_sub_materials(m);
+    std::unordered_map<Material, std::vector<Value>> dep_tables;
 
-  // Wait for all to complete
-  for (auto& t : threads) {
-    t.join();
+    for (const Material& dep : deps) {
+      // Skip terminal materials
+      if (dep.white_pieces() == 0 || dep.black_pieces() == 0) continue;
+
+      std::vector<Value> tb = get_wdl_tablebase(dep);
+      if (tb.empty()) {
+        tb = load_tablebase(dep);
+      }
+      if (!tb.empty()) {
+        dep_tables[dep] = std::move(tb);
+      }
+    }
+
+    // Verify dependencies
+    verify_dependencies(m, deps, dep_tables);
+
+    // Generate using position-level parallelism
+    generate_wdl_parallel(m, dep_tables);
   }
 
   auto total_end = std::chrono::high_resolution_clock::now();
