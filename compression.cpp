@@ -2092,7 +2092,7 @@ void CompressedTablebaseManager::clear() {
   block_cache_.clear();
 }
 
-CompressedTablebase* CompressedTablebaseManager::load_or_get(const Material& m) {
+CompressedTablebase* CompressedTablebaseManager::load_or_get(const Material& m, bool warn_if_missing) {
   auto it = tb_cache_.find(m);
   if (it != tb_cache_.end()) {
     return it->second.empty() ? nullptr : &it->second;
@@ -2109,7 +2109,7 @@ CompressedTablebase* CompressedTablebaseManager::load_or_get(const Material& m) 
   CompressedTablebase tb = load_compressed_tablebase(filename);
 
   // Warn once if tablebase is missing (for debugging dependency issues)
-  if (tb.empty()) {
+  if (tb.empty() && warn_if_missing) {
     static std::unordered_set<Material> warned;
     static std::mutex warn_mutex;
     std::lock_guard<std::mutex> lock(warn_mutex);
@@ -2125,7 +2125,8 @@ CompressedTablebase* CompressedTablebaseManager::load_or_get(const Material& m) 
 }
 
 const CompressedTablebase* CompressedTablebaseManager::get_tablebase(const Material& m) {
-  return load_or_get(m);
+  // Don't warn when just checking for existence
+  return load_or_get(m, false);
 }
 
 Value CompressedTablebaseManager::search_through_captures(
@@ -2210,7 +2211,7 @@ Value CompressedTablebaseManager::lookup_with_search(
     return Value::LOSS;  // From opponent's perspective after flip
   }
 
-  CompressedTablebase* tb = load_or_get(m);
+  CompressedTablebase* tb = load_or_get(m, true);  // Warn if missing during lookup
   if (!tb) {
     return Value::UNKNOWN;
   }

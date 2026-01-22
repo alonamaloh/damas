@@ -454,7 +454,7 @@ private:
   BlockCache block_cache_;
 
   // Load a compressed tablebase (or return cached)
-  CompressedTablebase* load_or_get(const Material& m);
+  CompressedTablebase* load_or_get(const Material& m, bool warn_if_missing = true);
 
   // Internal lookup with search through captures
   Value lookup_with_search(const Board& b,

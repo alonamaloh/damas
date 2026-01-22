@@ -491,8 +491,6 @@ void generate_wdl_parallel_compressed(
 
     // Update table_m in parallel with progress tracking
     std::atomic<std::size_t> progress_m{0};
-    std::atomic<std::size_t> resolved_m{0};
-    auto last_report_m = std::chrono::steady_clock::now();
 
     #pragma omp parallel for schedule(dynamic, 1024) reduction(||:changed)
     for (std::size_t idx = 0; idx < size_m; ++idx) {
@@ -503,28 +501,21 @@ void generate_wdl_parallel_compressed(
       if (new_val != Value::UNKNOWN) {
         table_m[idx] = new_val;
         changed = true;
-        resolved_m.fetch_add(1, std::memory_order_relaxed);
       }
 
-      // Progress reporting (only thread 0)
+      // Progress reporting (only thread 0, every 100k positions)
       std::size_t p = progress_m.fetch_add(1, std::memory_order_relaxed);
-      if (omp_get_thread_num() == 0 && (p % 1000000 == 0)) {
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_report_m).count();
-        if (elapsed >= 5) {
-          double pct = 100.0 * p / size_m;
-          std::cout << "\n      " << m << ": " << p << "/" << size_m
-                    << " (" << std::fixed << std::setprecision(1) << pct << "%)" << std::flush;
-          last_report_m = now;
-        }
+      if (omp_get_thread_num() == 0 && (p % 100000 == 0) && p > 0) {
+        double pct = 100.0 * p / size_m;
+        std::cout << "\r      " << m << ": " << p << "/" << size_m
+                  << " (" << std::fixed << std::setprecision(1) << pct << "%)   " << std::flush;
       }
     }
+    std::cout << "\r      " << m << ": " << size_m << "/" << size_m << " (100.0%)   " << std::endl;
 
     if (!symmetric) {
       // Update table_fm in parallel with progress tracking
       std::atomic<std::size_t> progress_fm{0};
-      std::atomic<std::size_t> resolved_fm{0};
-      auto last_report_fm = std::chrono::steady_clock::now();
 
       #pragma omp parallel for schedule(dynamic, 1024) reduction(||:changed)
       for (std::size_t idx = 0; idx < size_fm; ++idx) {
@@ -535,22 +526,17 @@ void generate_wdl_parallel_compressed(
         if (new_val != Value::UNKNOWN) {
           table_fm[idx] = new_val;
           changed = true;
-          resolved_fm.fetch_add(1, std::memory_order_relaxed);
         }
 
-        // Progress reporting (only thread 0)
+        // Progress reporting (only thread 0, every 100k positions)
         std::size_t p = progress_fm.fetch_add(1, std::memory_order_relaxed);
-        if (omp_get_thread_num() == 0 && (p % 1000000 == 0)) {
-          auto now = std::chrono::steady_clock::now();
-          auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - last_report_fm).count();
-          if (elapsed >= 5) {
-            double pct = 100.0 * p / size_fm;
-            std::cout << "\n      " << fm << ": " << p << "/" << size_fm
-                      << " (" << std::fixed << std::setprecision(1) << pct << "%)" << std::flush;
-            last_report_fm = now;
-          }
+        if (omp_get_thread_num() == 0 && (p % 100000 == 0) && p > 0) {
+          double pct = 100.0 * p / size_fm;
+          std::cout << "\r      " << fm << ": " << p << "/" << size_fm
+                    << " (" << std::fixed << std::setprecision(1) << pct << "%)   " << std::flush;
         }
       }
+      std::cout << "\r      " << fm << ": " << size_fm << "/" << size_fm << " (100.0%)   " << std::endl;
     }
 
     if (iteration <= 5 || iteration % 10 == 0) {
