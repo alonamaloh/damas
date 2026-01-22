@@ -8,6 +8,7 @@
 #include <iomanip>
 #include <iostream>
 #include <mutex>
+#include <unordered_set>
 
 // Forward declarations for optimized 2-value RLE
 std::vector<std::uint8_t> compress_rle_huffman_2val(const Value* values, std::size_t count);
@@ -18,6 +19,12 @@ std::vector<Value> decompress_rle_huffman_2val(const std::uint8_t* data, std::si
 std::vector<std::uint8_t> compress_rle_huffman_3val(const Value* values, std::size_t count);
 std::vector<Value> decompress_rle_huffman_3val(const std::uint8_t* data, std::size_t data_size,
                                                 std::size_t num_values);
+
+// Forward declarations for on-the-fly Huffman lookups
+static Value lookup_rle_huffman_2val(const std::uint8_t* data, std::size_t data_size,
+                                      std::size_t target_idx);
+static Value lookup_rle_huffman_3val(const std::uint8_t* data, std::size_t data_size,
+                                      std::size_t target_idx);
 
 // ============================================================================
 // Don't-Care Position Detection (Stage 1)
@@ -124,11 +131,7 @@ std::vector<Value> mark_dont_care_positions(
 
 namespace {
 
-// Maximum search depth to prevent stack overflow
-// This is conservative - in practice, don't-care chains should be short
-constexpr std::size_t MAX_SEARCH_DEPTH = 500;
-
-// Internal recursive search with cycle detection and statistics
+// Internal recursive search context for statistics tracking
 struct SearchContext {
   const std::unordered_map<Material, std::vector<Value>>* sub_tablebases;
   SearchStats* stats;
@@ -136,142 +139,95 @@ struct SearchContext {
   std::size_t nodes_this_search;
 };
 
-// Internal recursive search with cycle detection
-// Returns the WDL value from the perspective of the side to move
+// Internal recursive search through don't-care (capture) positions.
+// Since captures are irreversible, the recursion depth is bounded by
+// the number of pieces on the board.
 Value search_wdl_internal(
     const Board& b,
     const std::vector<Value>& tablebase,
     const Material& m,
-    std::unordered_set<std::uint64_t>& visited,
+    SearchContext& ctx);
+
+// Look up value, recursing into sub-tablebases if material changes
+Value lookup_value(
+    const Board& b,
+    const std::vector<Value>& tablebase,
+    const Material& m,
     SearchContext& ctx) {
 
   ctx.nodes_this_search++;
   ctx.current_depth++;
-
   if (ctx.stats && ctx.current_depth > ctx.stats->max_depth) {
     ctx.stats->max_depth = ctx.current_depth;
   }
 
-  // Depth limit to prevent stack overflow
-  // If we exceed the limit, conservatively return DRAW
-  if (ctx.current_depth > MAX_SEARCH_DEPTH) {
+  Material board_m = get_material(b);
+
+  // Material changed - look up in sub-tablebase
+  if (!(board_m == m)) {
     ctx.current_depth--;
-    return Value::DRAW;
+    if (!ctx.sub_tablebases) {
+      return Value::DRAW;  // Conservative
+    }
+    auto it = ctx.sub_tablebases->find(board_m);
+    if (it == ctx.sub_tablebases->end() || it->second.empty()) {
+      return Value::DRAW;  // Conservative
+    }
+    if (ctx.stats) ctx.stats->sub_tb_lookups++;
+    return search_wdl_internal(b, it->second, board_m, ctx);
   }
 
-  // Check for cycle (repetition = draw)
-  std::uint64_t hash = b.hash();
-  if (visited.count(hash)) {
-    if (ctx.stats) ctx.stats->cycles_detected++;
-    ctx.current_depth--;
-    return Value::DRAW;
-  }
-
-  // Get the stored value
+  // Same material - direct lookup
   std::size_t idx = board_to_index(b, m);
   Value stored = tablebase[idx];
 
-  // If not don't-care, return the stored value
   if (stored != Value::UNKNOWN) {
     ctx.current_depth--;
     return stored;
   }
 
-  // Mark as visited for cycle detection
-  visited.insert(hash);
+  // Don't-care position: search
+  Value result = search_wdl_internal(b, tablebase, m, ctx);
+  ctx.current_depth--;
+  return result;
+}
 
-  // Generate moves and search
+// Minimax search through capture positions
+Value search_wdl_internal(
+    const Board& b,
+    const std::vector<Value>& tablebase,
+    const Material& m,
+    SearchContext& ctx) {
+
   std::vector<Move> moves;
   generateMoves(b, moves);
 
-  // No moves = loss (can't happen from don't-care, but handle defensively)
   if (moves.empty()) {
-    visited.erase(hash);
-    ctx.current_depth--;
     return Value::LOSS;
   }
 
-  // Minimax: if any successor is LOSS for opponent, we WIN
-  //          if all successors are WIN for opponent, we LOSS
-  //          otherwise, DRAW
   bool has_draw = false;
 
   for (const Move& move : moves) {
     Board next = makeMove(b, move);
 
-    Value successor_value;
-
-    // Terminal check: if opponent has no pieces, they lose (we win)
-    // After makeMove, next.white is the opponent's pieces from their perspective
+    // Terminal: captured all opponent pieces
     if (next.white == 0) {
-      // Opponent has no pieces = terminal loss for them = win for us
       if (ctx.stats) ctx.stats->terminal_wins++;
-      successor_value = Value::LOSS;
-    } else {
-      Material next_m = get_material(next);
-
-      // Check if material changed (capture occurred)
-      if (!(next_m == flip(m))) {
-        // Material changed - look up in sub-tablebase
-        if (ctx.sub_tablebases) {
-          auto it = ctx.sub_tablebases->find(next_m);
-          if (it != ctx.sub_tablebases->end() && !it->second.empty()) {
-            if (ctx.stats) ctx.stats->sub_tb_lookups++;
-            std::size_t sub_idx = board_to_index(next, next_m);
-            if (sub_idx < it->second.size()) {
-              Value sub_val = it->second[sub_idx];
-              // If sub-tablebase also has don't-care, recurse into it
-              if (sub_val == Value::UNKNOWN) {
-                successor_value = search_wdl_internal(next, it->second, next_m, visited, ctx);
-              } else {
-                successor_value = sub_val;
-              }
-            } else {
-              // Index out of range - shouldn't happen
-              successor_value = Value::DRAW;
-            }
-          } else {
-            // Sub-tablebase not available - conservative: treat as draw
-            successor_value = Value::DRAW;
-          }
-        } else {
-          // No sub-tablebases provided - conservative: treat as draw
-          successor_value = Value::DRAW;
-        }
-      } else {
-        // Same material class - recurse
-        successor_value = search_wdl_internal(next, tablebase, flip(m), visited, ctx);
-      }
-    }
-
-    // Opponent's loss is our win
-    if (successor_value == Value::LOSS) {
-      visited.erase(hash);
-      ctx.current_depth--;
       return Value::WIN;
     }
 
-    if (successor_value == Value::DRAW) {
+    Value val = lookup_value(next, tablebase, flip(m), ctx);
+
+    if (val == Value::LOSS) {
+      return Value::WIN;
+    }
+    if (val == Value::DRAW) {
       has_draw = true;
     }
   }
 
-  visited.erase(hash);
-  ctx.current_depth--;
-
-  // If we found a draw, we can draw; otherwise all moves lead to opponent winning
   return has_draw ? Value::DRAW : Value::LOSS;
-}
-
-// Simple version without sub-tablebases (for backward compatibility)
-Value search_wdl_simple(
-    const Board& b,
-    const std::vector<Value>& tablebase,
-    const Material& m,
-    std::unordered_set<std::uint64_t>& visited) {
-
-  SearchContext ctx{nullptr, nullptr, 0, 0};
-  return search_wdl_internal(b, tablebase, m, visited, ctx);
 }
 
 } // anonymous namespace
@@ -281,8 +237,8 @@ Value lookup_wdl_with_search(
     const std::vector<Value>& tablebase,
     const Material& m) {
 
-  std::unordered_set<std::uint64_t> visited;
-  return search_wdl_simple(b, tablebase, m, visited);
+  SearchContext ctx{nullptr, nullptr, 0, 0};
+  return lookup_value(b, tablebase, m, ctx);
 }
 
 Value lookup_wdl_with_search(
@@ -305,13 +261,10 @@ Value lookup_wdl_with_search(
   // Need to search
   if (stats) stats->searches++;
 
-  std::unordered_set<std::uint64_t> visited;
   SearchContext ctx{&sub_tablebases, stats, 0, 0};
-
-  Value result = search_wdl_internal(b, tablebase, m, visited, ctx);
+  Value result = search_wdl_internal(b, tablebase, m, ctx);
 
   if (stats) stats->total_nodes += ctx.nodes_this_search;
-
   return result;
 }
 
@@ -339,8 +292,10 @@ inline Value int_to_value(std::uint8_t i) {
     case 0: return Value::WIN;
     case 1: return Value::DRAW;
     case 2: return Value::LOSS;
-    case 3: return Value::UNKNOWN;
-    default: return Value::UNKNOWN;
+    case 3: return Value::UNKNOWN;  // Don't-care position
+    default:
+      std::cerr << "int_to_value: invalid value " << static_cast<int>(i) << "\n";
+      std::exit(1);
   }
 }
 
@@ -447,10 +402,8 @@ std::vector<Value> decompress_rle_binary_search(const std::uint8_t* data, std::s
 }
 
 // Lookup a single value using binary search on RLE records.
-// Returns the value at the given index.
 Value lookup_rle_binary_search(const std::uint8_t* data, std::size_t data_size, std::size_t index) {
   std::size_t num_records = data_size / 2;
-  if (num_records == 0) return Value::UNKNOWN;
 
   // Binary search to find the record that covers this index.
   // We want the largest start_idx <= index.
@@ -469,8 +422,6 @@ Value lookup_rle_binary_search(const std::uint8_t* data, std::size_t data_size, 
   }
 
   // lo is now the first record with start_idx > index, so lo-1 is our record
-  if (lo == 0) return Value::UNKNOWN;  // Shouldn't happen if data is valid
-
   std::uint16_t record = data[(lo - 1) * 2] | (data[(lo - 1) * 2 + 1] << 8);
   std::uint8_t val = (record >> 14) & 0x3;
   return int_to_value(val);
@@ -564,9 +515,7 @@ std::vector<Value> decompress_default_exceptions(const std::uint8_t* data, std::
 }
 
 // Lookup a single value using binary search on exception list.
-Value lookup_default_exceptions(const std::uint8_t* data, std::size_t data_size, std::size_t index) {
-  if (data_size < 3) return Value::UNKNOWN;
-
+Value lookup_default_exceptions(const std::uint8_t* data, std::size_t /*data_size*/, std::size_t index) {
   // Read header
   std::uint8_t default_value = data[0] & 0x3;
   std::uint16_t num_exceptions = data[1] | (data[2] << 8);
@@ -720,74 +669,6 @@ std::size_t expected_compressed_size(std::size_t num_values, CompressionMethod m
 }
 
 // ============================================================================
-// LRU Cache Implementation (Stage 3)
-// ============================================================================
-
-BlockCache::BlockCache(std::size_t max_size)
-    : max_size_(max_size > 0 ? max_size : DEFAULT_CACHE_SIZE) {}
-
-const std::vector<Value>* BlockCache::get_or_decompress(
-    std::uint32_t block_idx,
-    const CompressedTablebase& tb) {
-
-  // Build cache key from material and block index
-  BlockCacheKey key{tb.material, block_idx};
-
-  // Check if already in cache
-  auto it = cache_map_.find(key);
-  if (it != cache_map_.end()) {
-    // Cache hit - move to front
-    hits_++;
-    lru_list_.splice(lru_list_.begin(), lru_list_, it->second);
-    return &it->second->second;
-  }
-
-  // Cache miss - decompress the block
-  misses_++;
-
-  // Get block info
-  if (block_idx >= tb.num_blocks) {
-    return nullptr;
-  }
-
-  std::uint32_t block_offset = tb.block_offsets[block_idx];
-  const std::uint8_t* block_ptr = tb.block_data.data() + block_offset;
-
-  // Read block header
-  CompressionMethod method = static_cast<CompressionMethod>(block_ptr[0]);
-  std::uint16_t compressed_size = block_ptr[1] | (block_ptr[2] << 8);
-  const std::uint8_t* data = block_ptr + 3;
-
-  // Calculate number of values in this block
-  std::size_t block_start = static_cast<std::size_t>(block_idx) * BLOCK_SIZE;
-  std::size_t block_end = std::min(block_start + BLOCK_SIZE,
-                                   static_cast<std::size_t>(tb.num_positions));
-  std::size_t num_values = block_end - block_start;
-
-  // Decompress
-  std::vector<Value> decompressed = decompress_block(data, compressed_size, num_values, method);
-
-  // Evict oldest if cache is full
-  if (lru_list_.size() >= max_size_) {
-    auto& oldest = lru_list_.back();
-    cache_map_.erase(oldest.first);
-    lru_list_.pop_back();
-  }
-
-  // Insert at front
-  lru_list_.emplace_front(key, std::move(decompressed));
-  cache_map_[key] = lru_list_.begin();
-
-  return &lru_list_.front().second;
-}
-
-void BlockCache::clear() {
-  lru_list_.clear();
-  cache_map_.clear();
-  hits_ = 0;
-  misses_ = 0;
-}
-
 // ============================================================================
 // CompressedTablebase Creation and Lookup (Stage 3)
 // ============================================================================
@@ -866,12 +747,7 @@ CompressedTablebase compress_tablebase(
 
 Value lookup_compressed(
     const CompressedTablebase& tb,
-    std::size_t index,
-    BlockCache* cache) {
-
-  if (index >= tb.num_positions) {
-    return Value::UNKNOWN;
-  }
+    std::size_t index) {
 
   std::uint32_t block_idx = static_cast<std::uint32_t>(index / BLOCK_SIZE);
   std::size_t idx_in_block = index % BLOCK_SIZE;
@@ -880,114 +756,57 @@ Value lookup_compressed(
   std::uint32_t block_offset = tb.block_offsets[block_idx];
   const std::uint8_t* block_ptr = tb.block_data.data() + block_offset;
   CompressionMethod method = static_cast<CompressionMethod>(block_ptr[0]);
-
-  // For random-access methods, we can decode directly
-  if (method == CompressionMethod::RAW_2BIT) {
-    const std::uint8_t* data = block_ptr + 3;
-    std::size_t byte_idx = idx_in_block / 4;
-    std::size_t bit_pos = (idx_in_block % 4) * 2;
-    std::uint8_t v = (data[byte_idx] >> bit_pos) & 0x3;
-    return int_to_value(v);
-  }
-
-  if (method == CompressionMethod::RLE_BINARY_SEARCH) {
-    std::uint16_t compressed_size = block_ptr[1] | (block_ptr[2] << 8);
-    const std::uint8_t* data = block_ptr + 3;
-    return lookup_rle_binary_search(data, compressed_size, idx_in_block);
-  }
-
-  if (method == CompressionMethod::DEFAULT_EXCEPTIONS) {
-    std::uint16_t compressed_size = block_ptr[1] | (block_ptr[2] << 8);
-    const std::uint8_t* data = block_ptr + 3;
-    return lookup_default_exceptions(data, compressed_size, idx_in_block);
-  }
-
-  // For Huffman methods, use cache (sequential-access only)
-  if (method == CompressionMethod::RLE_HUFFMAN_2VAL) {
-    if (cache) {
-      const std::vector<Value>* block = cache->get_or_decompress(block_idx, tb);
-      if (block && idx_in_block < block->size()) {
-        return (*block)[idx_in_block];
-      }
-    }
-    // Fall through to decompress on demand if no cache
-  }
-
-  // For sequential-access methods, use cache
-  if (cache) {
-    const std::vector<Value>* block = cache->get_or_decompress(block_idx, tb);
-    if (block && idx_in_block < block->size()) {
-      return (*block)[idx_in_block];
-    }
-  }
-
-  // Fallback: decompress entire block (inefficient, but correct)
   std::uint16_t compressed_size = block_ptr[1] | (block_ptr[2] << 8);
   const std::uint8_t* data = block_ptr + 3;
 
-  std::size_t block_start = static_cast<std::size_t>(block_idx) * BLOCK_SIZE;
-  std::size_t block_end = std::min(block_start + BLOCK_SIZE,
-                                   static_cast<std::size_t>(tb.num_positions));
-  std::size_t num_values = block_end - block_start;
-
-  auto decompressed = decompress_block(data, compressed_size, num_values, method);
-  if (idx_in_block < decompressed.size()) {
-    return decompressed[idx_in_block];
+  switch (method) {
+    case CompressionMethod::RAW_2BIT: {
+      std::size_t byte_idx = idx_in_block / 4;
+      std::size_t bit_pos = (idx_in_block % 4) * 2;
+      return int_to_value((data[byte_idx] >> bit_pos) & 0x3);
+    }
+    case CompressionMethod::RLE_BINARY_SEARCH:
+      return lookup_rle_binary_search(data, compressed_size, idx_in_block);
+    case CompressionMethod::DEFAULT_EXCEPTIONS:
+      return lookup_default_exceptions(data, compressed_size, idx_in_block);
+    case CompressionMethod::RLE_HUFFMAN_2VAL:
+      return lookup_rle_huffman_2val(data, compressed_size, idx_in_block);
+    case CompressionMethod::RLE_HUFFMAN_3VAL:
+      return lookup_rle_huffman_3val(data, compressed_size, idx_in_block);
   }
 
-  return Value::UNKNOWN;
+  std::cerr << "lookup_compressed: unknown compression method "
+            << static_cast<int>(method) << "\n";
+  std::exit(1);
 }
 
-// Internal recursive search for compressed tablebases.
-// Unlike search_wdl_internal which uses UNKNOWN as sentinel, this checks
-// has_captures() to determine if a position needs searching (since run-extended
-// compression stores possibly-wrong values for tense positions).
-static Value search_compressed_internal(
+// Look up WDL value from a compressed tablebase, searching through captures.
+// Since captures are irreversible, recursion depth is bounded by piece count.
+Value lookup_compressed_with_search(
     const Board& b,
-    const CompressedTablebase& tb,
-    BlockCache* cache,
-    std::unordered_set<std::uint64_t>& visited,
-    int depth) {
+    const CompressedTablebase& tb) {
 
-  // Depth limit to prevent stack overflow
-  if (depth > 100) {
-    return Value::DRAW;
-  }
-
-  // Check for cycle (repetition = draw)
-  std::uint64_t hash = b.hash();
-  if (visited.count(hash)) {
-    return Value::DRAW;
-  }
-
-  // If this is not a tense position, return the stored value
+  // Quiet position: direct lookup
   if (!has_captures(b)) {
     std::size_t idx = board_to_index(b, tb.material);
-    return lookup_compressed(tb, idx, cache);
+    return lookup_compressed(tb, idx);
   }
 
-  // Mark as visited for cycle detection
-  visited.insert(hash);
-
-  // Generate capture moves (mandatory)
+  // Capture position: minimax search
   std::vector<Move> moves;
   generateMoves(b, moves);
 
-  // No moves = loss
   if (moves.empty()) {
-    visited.erase(hash);
     return Value::LOSS;
   }
 
-  // Minimax through captures
   bool has_draw = false;
 
   for (const Move& move : moves) {
     Board next = makeMove(b, move);
 
-    // Terminal check: if opponent has no pieces, we win
+    // Terminal: captured all opponent pieces
     if (next.white == 0) {
-      visited.erase(hash);
       return Value::WIN;
     }
 
@@ -995,43 +814,22 @@ static Value search_compressed_internal(
     Material next_m = get_material(next);
     if (!(next_m == flip(tb.material))) {
       // Material changed - would need sub-tablebase lookup
-      // For now, conservatively return DRAW for such cases
+      // Conservatively treat as draw
       has_draw = true;
       continue;
     }
 
-    // Recurse (note: after makeMove, perspective is flipped)
-    Value successor_value = search_compressed_internal(next, tb, cache, visited, depth + 1);
+    Value val = lookup_compressed_with_search(next, tb);
 
-    // If opponent loses, we win
-    if (successor_value == Value::LOSS) {
-      visited.erase(hash);
+    if (val == Value::LOSS) {
       return Value::WIN;
     }
-
-    if (successor_value == Value::DRAW) {
+    if (val == Value::DRAW) {
       has_draw = true;
     }
   }
 
-  visited.erase(hash);
   return has_draw ? Value::DRAW : Value::LOSS;
-}
-
-Value lookup_compressed_with_search(
-    const Board& b,
-    const CompressedTablebase& tb,
-    BlockCache* cache) {
-
-  // If not a tense position, return the stored value directly
-  if (!has_captures(b)) {
-    std::size_t idx = board_to_index(b, tb.material);
-    return lookup_compressed(tb, idx, cache);
-  }
-
-  // Tense position - need to search through captures
-  std::unordered_set<std::uint64_t> visited;
-  return search_compressed_internal(b, tb, cache, visited, 0);
 }
 
 // ============================================================================
@@ -1486,6 +1284,66 @@ std::vector<Value> decompress_rle_huffman_2val(const std::uint8_t* data, std::si
   }
 
   return result;
+}
+
+// Lookup a single value from Huffman 2-val encoded data by iterating through runs.
+static Value lookup_rle_huffman_2val(const std::uint8_t* data, std::size_t /*data_size*/,
+                                      std::size_t target_idx) {
+  // Check for single-value block marker
+  if (data[1] == 0) {
+    return int_to_value(data[0] & 0x3);
+  }
+
+  // Parse header
+  std::uint8_t val_0 = data[0] & 0x3;
+  std::uint8_t val_1 = (data[0] >> 2) & 0x3;
+  std::uint16_t run_count = data[1] | (data[2] << 8);
+  std::uint16_t bit_bytes = data[3] | (data[4] << 8);
+
+  // Decode runs until we find target_idx
+  BitReader reader(data + 5, bit_bytes);
+  std::size_t pos = 0;
+  std::uint8_t current_value = val_0;
+
+  for (std::uint16_t r = 0; r < run_count; ++r) {
+    // Read prefix (count leading 1s until we hit a 0)
+    int prefix = 0;
+    while (reader.read(1) == 1) {
+      prefix++;
+      if (prefix >= 14) break;
+    }
+
+    // Decode run length
+    std::size_t run_length;
+    switch (prefix) {
+      case 0: run_length = 1; break;
+      case 1: run_length = 2; break;
+      case 2: run_length = 3; break;
+      case 3: run_length = 4; break;
+      case 4: run_length = 5 + reader.read(2); break;
+      case 5: run_length = 9 + reader.read(3); break;
+      case 6: run_length = 17 + reader.read(4); break;
+      case 7: run_length = 33 + reader.read(5); break;
+      case 8: run_length = 65 + reader.read(6); break;
+      case 9: run_length = 129 + reader.read(7); break;
+      case 10: run_length = 257 + reader.read(8); break;
+      case 11: run_length = 513 + reader.read(9); break;
+      case 12: run_length = 1025 + reader.read(10); break;
+      default: run_length = 2049 + reader.read(14); break;
+    }
+
+    // Check if target is in this run
+    if (target_idx < pos + run_length) {
+      return int_to_value(current_value);
+    }
+
+    pos += run_length;
+    current_value = (current_value == val_0) ? val_1 : val_0;
+  }
+
+  std::cerr << "lookup_rle_huffman_2val: target_idx " << target_idx
+            << " not found in " << run_count << " runs\n";
+  std::exit(1);
 }
 
 // ============================================================================
@@ -1973,6 +1831,68 @@ std::vector<Value> decompress_rle_huffman_3val(const std::uint8_t* data, std::si
   return result;
 }
 
+// Lookup a single value from Huffman 3-val encoded data by iterating through runs.
+static Value lookup_rle_huffman_3val(const std::uint8_t* data, std::size_t /*data_size*/,
+                                      std::size_t target_idx) {
+  // Check for single-value block marker
+  if (data[1] == 0) {
+    return int_to_value(data[0] & 0x3);
+  }
+
+  // Parse header
+  std::uint8_t val_0 = data[0] & 0x3;
+  std::uint8_t val_1 = (data[0] >> 2) & 0x3;
+  std::uint8_t val_2 = (data[0] >> 4) & 0x3;
+  std::uint16_t run_count = data[1] | (data[2] << 8);
+  std::uint16_t bit_bytes = data[3] | (data[4] << 8);
+
+  // Decode runs until we find target_idx
+  BitReader reader(data + 5, bit_bytes);
+  std::size_t pos = 0;
+
+  // Track state for prediction
+  std::uint8_t val_k_minus_2 = val_0;
+  std::uint8_t val_k_minus_1 = val_1;
+
+  for (std::uint16_t k = 0; k < run_count; ++k) {
+    // Decode symbol using Scheme B
+    auto [is_true, run_length, which_false] = decode_symbol(reader);
+
+    std::uint8_t run_value;
+    if (k == 0) {
+      run_value = val_0;
+    } else if (k == 1) {
+      run_value = val_1;
+    } else if (is_true) {
+      run_value = val_k_minus_2;
+    } else if (which_false == 0) {
+      run_value = val_k_minus_1;
+    } else {
+      // Third value (neither k-2 nor k-1)
+      if (val_k_minus_2 != val_0 && val_k_minus_1 != val_0) {
+        run_value = val_0;
+      } else if (val_k_minus_2 != val_1 && val_k_minus_1 != val_1) {
+        run_value = val_1;
+      } else {
+        run_value = val_2;
+      }
+    }
+
+    // Check if target is in this run
+    if (target_idx < pos + run_length) {
+      return int_to_value(run_value);
+    }
+
+    pos += run_length;
+    val_k_minus_2 = val_k_minus_1;
+    val_k_minus_1 = run_value;
+  }
+
+  std::cerr << "lookup_rle_huffman_3val: target_idx " << target_idx
+            << " not found in " << run_count << " runs\n";
+  std::exit(1);
+}
+
 // ============================================================================
 // Compressed Tablebase File I/O (Stage 5)
 // ============================================================================
@@ -2083,13 +2003,11 @@ CompressedTablebase load_compressed_tablebase(const std::string& filename) {
 // CompressedTablebaseManager Implementation (Public API)
 // ============================================================================
 
-CompressedTablebaseManager::CompressedTablebaseManager(const std::string& directory,
-                                                       std::size_t block_cache_size)
-    : directory_(directory), block_cache_(block_cache_size) {}
+CompressedTablebaseManager::CompressedTablebaseManager(const std::string& directory)
+    : directory_(directory) {}
 
 void CompressedTablebaseManager::clear() {
   tb_cache_.clear();
-  block_cache_.clear();
 }
 
 CompressedTablebase* CompressedTablebaseManager::load_or_get(const Material& m, bool warn_if_missing) {
@@ -2129,220 +2047,55 @@ const CompressedTablebase* CompressedTablebaseManager::get_tablebase(const Mater
   return load_or_get(m, false);
 }
 
-// Iterative minimax search through capture chains
-// Uses explicit stack to avoid stack overflow on deep capture sequences
-Value CompressedTablebaseManager::search_through_captures(
-    const Board& b,
-    std::unordered_set<std::uint64_t>& visited,
-    int /*depth*/) {
-
-  // Node limit to prevent exponential blowup
-  constexpr int MAX_NODES = 10000;
-  int nodes_visited = 0;
-
-  // Stack frame for iterative minimax
-  struct Frame {
-    Board board;
-    std::vector<Move> moves;
-    std::size_t move_idx;
-    bool has_draw;
-    bool has_unknown;
-    std::uint64_t hash;
-  };
-
-  std::vector<Frame> stack;
-  stack.reserve(64);
-
-  // Initialize root frame
-  {
-    std::uint64_t hash = b.hash();
-    if (visited.count(hash)) {
-      return Value::DRAW;  // Cycle at root
-    }
-
-    std::vector<Move> moves;
-    generateMoves(b, moves);
-
-    if (moves.empty()) {
-      return Value::LOSS;  // No moves at root
-    }
-
-    visited.insert(hash);
-    stack.push_back({b, std::move(moves), 0, false, false, hash});
-  }
-
-  Value pending_result = Value::UNKNOWN;  // Result from child to propagate up
-  bool have_pending = false;
-
-  while (!stack.empty()) {
-    Frame& frame = stack.back();
-
-    // Check node limit
-    if (++nodes_visited > MAX_NODES) {
-      // Clean up visited set and return DRAW (conservative)
-      for (auto& f : stack) {
-        visited.erase(f.hash);
-      }
-      return Value::DRAW;
-    }
-
-    // Process pending result from child
-    if (have_pending) {
-      have_pending = false;
-
-      // If opponent loses, we win (alpha-beta cutoff)
-      if (pending_result == Value::LOSS) {
-        visited.erase(frame.hash);
-        stack.pop_back();
-        pending_result = Value::WIN;
-        have_pending = true;
-        continue;
-      }
-
-      if (pending_result == Value::DRAW) {
-        frame.has_draw = true;
-      }
-      if (pending_result == Value::UNKNOWN) {
-        frame.has_unknown = true;
-      }
-
-      frame.move_idx++;
-    }
-
-    // Process remaining moves
-    while (frame.move_idx < frame.moves.size()) {
-      const Move& move = frame.moves[frame.move_idx];
-      Board next = makeMove(frame.board, move);
-
-      // Terminal check: opponent has no pieces = we win
-      if (next.white == 0) {
-        visited.erase(frame.hash);
-        stack.pop_back();
-        pending_result = Value::WIN;
-        have_pending = true;
-        goto continue_outer;
-      }
-
-      Material m = get_material(next);
-
-      // Terminal: opponent has no pieces (after material check)
-      if (m.white_pieces() == 0) {
-        pending_result = Value::LOSS;
-        have_pending = true;
-        break;  // Will process in next iteration
-      }
-
-      // Check cycle
-      std::uint64_t next_hash = next.hash();
-      if (visited.count(next_hash)) {
-        // Cycle = draw for this branch
-        frame.has_draw = true;
-        frame.move_idx++;
-        continue;
-      }
-
-      // Try to get tablebase for this material
-      CompressedTablebase* tb = load_or_get(m, true);
-      if (!tb) {
-        frame.has_unknown = true;
-        frame.move_idx++;
-        continue;
-      }
-
-      // If quiet position, lookup directly
-      if (!has_captures(next)) {
-        std::size_t idx = board_to_index(next, m);
-        Value val = lookup_compressed(*tb, idx, &block_cache_);
-
-        if (val == Value::LOSS) {
-          // Opponent loses = we win (cutoff)
-          visited.erase(frame.hash);
-          stack.pop_back();
-          pending_result = Value::WIN;
-          have_pending = true;
-          goto continue_outer;
-        }
-
-        if (val == Value::DRAW) frame.has_draw = true;
-        if (val == Value::UNKNOWN) frame.has_unknown = true;
-        frame.move_idx++;
-        continue;
-      }
-
-      // Tense position - need to push new frame (depth check)
-      if (static_cast<int>(stack.size()) >= 50) {
-        // Depth limit - treat as draw
-        frame.has_draw = true;
-        frame.move_idx++;
-        continue;
-      }
-
-      // Generate moves for successor
-      std::vector<Move> next_moves;
-      generateMoves(next, next_moves);
-
-      if (next_moves.empty()) {
-        // Opponent has no moves = opponent loses = we win
-        visited.erase(frame.hash);
-        stack.pop_back();
-        pending_result = Value::WIN;
-        have_pending = true;
-        goto continue_outer;
-      }
-
-      // Push new frame
-      visited.insert(next_hash);
-      stack.push_back({next, std::move(next_moves), 0, false, false, next_hash});
-      goto continue_outer;
-    }
-
-    // All moves processed for this frame
-    visited.erase(frame.hash);
-    stack.pop_back();
-
-    if (frame.has_unknown) {
-      pending_result = Value::UNKNOWN;
-    } else if (frame.has_draw) {
-      pending_result = Value::DRAW;
-    } else {
-      pending_result = Value::LOSS;  // All successors were wins for opponent
-    }
-    have_pending = true;
-
-continue_outer:;
-  }
-
-  return have_pending ? pending_result : Value::UNKNOWN;
-}
-
-Value CompressedTablebaseManager::lookup_with_search(
-    const Board& b,
-    std::unordered_set<std::uint64_t>& visited,
-    int /*depth*/) {
-
+// Look up WDL value, searching through capture positions as needed.
+// Since captures are irreversible, the recursion depth is bounded by
+// the number of pieces on the board (at most ~24).
+Value CompressedTablebaseManager::lookup_wdl(const Board& b) {
   Material m = get_material(b);
 
   // Terminal: opponent has no pieces
   if (m.white_pieces() == 0) {
-    return Value::LOSS;  // From opponent's perspective after flip
+    return Value::LOSS;
   }
 
-  CompressedTablebase* tb = load_or_get(m, true);  // Warn if missing during lookup
+  CompressedTablebase* tb = load_or_get(m, true);
   if (!tb) {
     return Value::UNKNOWN;
   }
 
-  // If not a tense position, return the stored value directly
+  // Quiet position: direct lookup
   if (!has_captures(b)) {
-    std::size_t idx = board_to_index(b, m);
-    return lookup_compressed(*tb, idx, &block_cache_);
+    return lookup_compressed(*tb, board_to_index(b, m));
   }
 
-  // Tense position - search through captures
-  return search_through_captures(b, visited, 0);
-}
+  // Capture position: minimax search
+  std::vector<Move> moves;
+  generateMoves(b, moves);
+  if (moves.empty()) {
+    return Value::LOSS;
+  }
 
-Value CompressedTablebaseManager::lookup_wdl(const Board& board) {
-  std::unordered_set<std::uint64_t> visited;
-  return lookup_with_search(board, visited, 0);
+  bool has_draw = false;
+  for (const Move& move : moves) {
+    Board next = makeMove(b, move);
+
+    // Terminal: captured all opponent pieces
+    if (next.white == 0) {
+      return Value::WIN;
+    }
+
+    Value val = lookup_wdl(next);
+    if (val == Value::LOSS) {
+      return Value::WIN;  // Found a winning move
+    }
+    if (val == Value::DRAW) {
+      has_draw = true;
+    }
+    if (val == Value::UNKNOWN) {
+      // Tablebase missing for this material - treat conservatively as draw
+      has_draw = true;
+    }
+  }
+
+  return has_draw ? Value::DRAW : Value::LOSS;
 }

@@ -5,7 +5,6 @@
 #include <cstdint>
 #include <vector>
 #include <unordered_map>
-#include <unordered_set>
 
 // ============================================================================
 // Don't-Care Position Detection (Stage 1)
@@ -62,7 +61,6 @@ struct SearchStats {
   std::size_t searches = 0;          // Positions requiring search
   std::size_t total_nodes = 0;       // Total nodes visited in all searches
   std::size_t max_depth = 0;         // Maximum search depth encountered
-  std::size_t cycles_detected = 0;   // Repetitions detected (draws)
   std::size_t terminal_wins = 0;     // Terminal positions (opponent has no pieces)
   std::size_t sub_tb_lookups = 0;    // Lookups into sub-tablebases
 
@@ -76,7 +74,8 @@ struct SearchStats {
 };
 
 // Lookup WDL value, searching through don't-care positions if needed.
-// Uses cycle detection to handle repetitions (which are draws).
+// Don't-care positions are those with captures, which are irreversible,
+// so the search is naturally bounded by the number of pieces on the board.
 //
 // Parameters:
 //   b: The board position to look up
@@ -185,67 +184,6 @@ std::pair<CompressionMethod, std::vector<std::uint8_t>> compress_block_best(
 std::size_t expected_compressed_size(std::size_t num_values, CompressionMethod method);
 
 // ============================================================================
-// LRU Cache for Decompressed Blocks (Stage 3)
-// ============================================================================
-
-#include <list>
-
-// Cache key: combines material and block index to avoid collisions across tablebases
-struct BlockCacheKey {
-  Material material;
-  std::uint32_t block_idx;
-
-  bool operator==(const BlockCacheKey& other) const {
-    return material == other.material && block_idx == other.block_idx;
-  }
-};
-
-// Hash function for BlockCacheKey
-struct BlockCacheKeyHash {
-  std::size_t operator()(const BlockCacheKey& key) const {
-    // Combine material hash with block index
-    std::size_t h = std::hash<Material>{}(key.material);
-    h ^= std::hash<std::uint32_t>{}(key.block_idx) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    return h;
-  }
-};
-
-// LRU cache for decompressed blocks.
-// Used for sequential-access compression methods that require full block decompression.
-class BlockCache {
-public:
-  static constexpr std::size_t DEFAULT_CACHE_SIZE = 16;
-
-  explicit BlockCache(std::size_t max_size = DEFAULT_CACHE_SIZE);
-
-  // Get or decompress a block.
-  // Returns pointer to the cached block data (valid until next access).
-  const std::vector<Value>* get_or_decompress(
-      std::uint32_t block_idx,
-      const CompressedTablebase& tb);
-
-  // Clear the cache.
-  void clear();
-
-  // Statistics
-  std::size_t hits() const { return hits_; }
-  std::size_t misses() const { return misses_; }
-  double hit_rate() const {
-    std::size_t total = hits_ + misses_;
-    return total > 0 ? static_cast<double>(hits_) / total : 0.0;
-  }
-
-private:
-  std::size_t max_size_;
-  std::size_t hits_ = 0;
-  std::size_t misses_ = 0;
-
-  // LRU list: front = most recently used, back = least recently used
-  std::list<std::pair<BlockCacheKey, std::vector<Value>>> lru_list_;
-  std::unordered_map<BlockCacheKey, decltype(lru_list_)::iterator, BlockCacheKeyHash> cache_map_;
-};
-
-// ============================================================================
 // CompressedTablebase Creation and Lookup (Stage 3)
 // ============================================================================
 
@@ -255,19 +193,16 @@ CompressedTablebase compress_tablebase(
     const Material& m);
 
 // Look up a single value in a compressed tablebase.
-// For random-access methods, this is O(1).
-// For sequential-access methods, uses the provided cache (or decompresses on-demand).
+// Decompresses the relevant block on demand (stateless, thread-safe).
 Value lookup_compressed(
     const CompressedTablebase& tb,
-    std::size_t index,
-    BlockCache* cache = nullptr);
+    std::size_t index);
 
 // Look up a value with search for don't-care positions.
 // Combines compressed lookup with the search algorithm from Stage 2.
 Value lookup_compressed_with_search(
     const Board& b,
-    const CompressedTablebase& tb,
-    BlockCache* cache = nullptr);
+    const CompressedTablebase& tb);
 
 // ============================================================================
 // Compression Statistics (Stage 3)
@@ -413,10 +348,9 @@ void print_run_statistics(const RunStatistics& stats);
 // Compressed Tablebase Lookup with Search (Public API)
 // ============================================================================
 
-// A cache manager for compressed tablebases that provides a clean API for
-// looking up WDL values. Handles:
+// Manager for compressed tablebases that provides a clean API for looking up
+// WDL values. Handles:
 // - Loading compressed tablebases on demand
-// - Caching loaded tablebases and decompressed blocks
 // - Searching through tense (capture) positions
 // - Looking up sub-tablebases when material changes after captures
 //
@@ -427,9 +361,7 @@ void print_run_statistics(const RunStatistics& stats);
 class CompressedTablebaseManager {
 public:
   // Construct with directory containing compressed tablebases (cwdl_*.bin)
-  // block_cache_size: number of decompressed blocks to cache (default 64)
-  explicit CompressedTablebaseManager(const std::string& directory,
-                                       std::size_t block_cache_size = 64);
+  explicit CompressedTablebaseManager(const std::string& directory);
 
   // Look up the WDL value for a position.
   // Handles tense positions by searching through forced capture sequences.
@@ -439,31 +371,17 @@ public:
   // Get a loaded tablebase (or nullptr if not available)
   const CompressedTablebase* get_tablebase(const Material& m);
 
-  // Clear all caches (tablebases and blocks)
+  // Clear loaded tablebases
   void clear();
 
   // Get the directory being used
   const std::string& directory() const { return directory_; }
 
-  // Get block cache statistics
-  const BlockCache& block_cache() const { return block_cache_; }
-
 private:
   std::string directory_;
   std::unordered_map<Material, CompressedTablebase> tb_cache_;
-  BlockCache block_cache_;
 
   // Load a compressed tablebase (or return cached)
   CompressedTablebase* load_or_get(const Material& m, bool warn_if_missing = true);
-
-  // Internal lookup with search through captures
-  Value lookup_with_search(const Board& b,
-                           std::unordered_set<std::uint64_t>& visited,
-                           int depth);
-
-  // Search through capture sequences (tense positions)
-  Value search_through_captures(const Board& b,
-                                std::unordered_set<std::uint64_t>& visited,
-                                int depth);
 };
 

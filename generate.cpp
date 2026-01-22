@@ -471,7 +471,7 @@ void generate_wdl_parallel_compressed(
   std::vector<std::unique_ptr<CompressedTablebaseManager>> thread_managers;
   for (int i = 0; i < num_threads; ++i) {
     thread_managers.push_back(
-        std::make_unique<CompressedTablebaseManager>(tb_directory, 32));
+        std::make_unique<CompressedTablebaseManager>(tb_directory));
   }
 
   std::cout << "  [3/6] Starting iterative solver..." << std::endl;
@@ -1406,7 +1406,7 @@ void solve_all_parallel_compressed(int max_pieces, int threshold, const std::str
   auto total_start = std::chrono::high_resolution_clock::now();
 
   // Create a manager to check for existing compressed tablebases
-  CompressedTablebaseManager check_manager(tb_directory, 1);
+  CompressedTablebaseManager check_manager(tb_directory);
 
   // Process materials in dependency order
   for (const Material& m : sorted) {

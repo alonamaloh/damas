@@ -914,46 +914,6 @@ TEST(block_indexing) {
   ASSERT_EQ(expected_blocks, 4u);
 }
 
-TEST(lru_cache_eviction) {
-  // Create a small cache and test eviction
-  BlockCache cache(2);  // Only 2 entries
-
-  // Create a small compressed tablebase
-  Material m{0, 0, 0, 0, 1, 1};  // KvK
-  std::vector<Value> tb(BLOCK_SIZE * 3);  // 3 blocks
-  for (std::size_t i = 0; i < tb.size(); ++i) {
-    tb[i] = static_cast<Value>((i % 3) + 1);  // WIN, LOSS, DRAW cycling
-  }
-
-  CompressedTablebase ctb = compress_tablebase(tb, m);
-  ASSERT_EQ(ctb.num_blocks, 3u);
-
-  // Access block 0
-  cache.get_or_decompress(0, ctb);
-  ASSERT_EQ(cache.misses(), 1u);
-  ASSERT_EQ(cache.hits(), 0u);
-
-  // Access block 1
-  cache.get_or_decompress(1, ctb);
-  ASSERT_EQ(cache.misses(), 2u);
-
-  // Access block 0 again (should be hit)
-  cache.get_or_decompress(0, ctb);
-  ASSERT_EQ(cache.hits(), 1u);
-
-  // Access block 2 (should evict block 1, the LRU)
-  cache.get_or_decompress(2, ctb);
-  ASSERT_EQ(cache.misses(), 3u);
-
-  // Access block 0 (should be hit, still cached)
-  cache.get_or_decompress(0, ctb);
-  ASSERT_EQ(cache.hits(), 2u);
-
-  // Access block 1 (was evicted, should miss)
-  cache.get_or_decompress(1, ctb);
-  ASSERT_EQ(cache.misses(), 4u);
-}
-
 TEST(compress_tablebase_roundtrip) {
   // Test that compressing and looking up a tablebase works correctly.
   // Since tense positions may have their values modified during compression
@@ -967,46 +927,12 @@ TEST(compress_tablebase_roundtrip) {
   }
 
   CompressedTablebase ctb = compress_tablebase(original, m);
-  BlockCache cache(4);
 
   // Verify all positions using lookup_compressed_with_search
   for (std::size_t i = 0; i < original.size(); ++i) {
     Board b = index_to_board(i, m);
-    Value looked_up = lookup_compressed_with_search(b, ctb, &cache);
+    Value looked_up = lookup_compressed_with_search(b, ctb);
     ASSERT(looked_up == original[i]);
-  }
-}
-
-TEST(compressed_lookup_with_cache) {
-  // Test that cache-based lookup works.
-  // Since tense positions may have their values modified during compression
-  // (to extend runs), we use lookup_compressed_with_search which handles
-  // tense positions by searching.
-  Material m{0, 0, 0, 0, 1, 1};  // KvK
-  std::vector<Value> original = load_tablebase(m);
-  if (original.empty()) {
-    std::cout << "(skipped - no tablebase) ";
-    return;
-  }
-
-  CompressedTablebase ctb = compress_tablebase(original, m);
-  BlockCache cache(4);
-
-  // Look up all positions using cache and search
-  for (std::size_t i = 0; i < original.size(); ++i) {
-    Board b = index_to_board(i, m);
-    Value looked_up = lookup_compressed_with_search(b, ctb, &cache);
-    ASSERT(looked_up == original[i]);
-  }
-
-  // If Huffman methods are selected, the cache will be used.
-  // If random-access methods are selected, the cache won't be used.
-  // Either way, the lookups should be correct (verified above).
-  // If cache was used, we should have a good hit rate for sequential access.
-  if (cache.misses() > 0) {
-    // Cache was used (Huffman method selected)
-    // For sequential access of all positions, hit rate should be high
-    ASSERT(cache.hit_rate() > 0.9);
   }
 }
 
@@ -1125,14 +1051,14 @@ TEST(default_exceptions_lookup) {
   tb.block_data.insert(tb.block_data.end(), compressed.begin(), compressed.end());
 
   // Test lookups at default positions
-  ASSERT(lookup_compressed(tb, 0, nullptr) == Value::WIN);
-  ASSERT(lookup_compressed(tb, 50, nullptr) == Value::WIN);
-  ASSERT(lookup_compressed(tb, 200, nullptr) == Value::WIN);
+  ASSERT(lookup_compressed(tb, 0) == Value::WIN);
+  ASSERT(lookup_compressed(tb, 50) == Value::WIN);
+  ASSERT(lookup_compressed(tb, 200) == Value::WIN);
 
   // Test lookups at exception positions
-  ASSERT(lookup_compressed(tb, 100, nullptr) == Value::LOSS);
-  ASSERT(lookup_compressed(tb, 500, nullptr) == Value::DRAW);
-  ASSERT(lookup_compressed(tb, 999, nullptr) == Value::UNKNOWN);
+  ASSERT(lookup_compressed(tb, 100) == Value::LOSS);
+  ASSERT(lookup_compressed(tb, 500) == Value::DRAW);
+  ASSERT(lookup_compressed(tb, 999) == Value::UNKNOWN);
 }
 
 TEST(default_exceptions_vs_rle) {
@@ -1243,17 +1169,17 @@ TEST(rle_binary_search_lookup) {
   ctb.block_data.insert(ctb.block_data.end(), compressed.begin(), compressed.end());
 
   // Test lookups at various positions
-  ASSERT(lookup_compressed(ctb, 0, nullptr) == Value::WIN);
-  ASSERT(lookup_compressed(ctb, 50, nullptr) == Value::WIN);
-  ASSERT(lookup_compressed(ctb, 99, nullptr) == Value::WIN);
-  ASSERT(lookup_compressed(ctb, 100, nullptr) == Value::LOSS);
-  ASSERT(lookup_compressed(ctb, 125, nullptr) == Value::LOSS);
-  ASSERT(lookup_compressed(ctb, 149, nullptr) == Value::LOSS);
-  ASSERT(lookup_compressed(ctb, 150, nullptr) == Value::DRAW);
-  ASSERT(lookup_compressed(ctb, 200, nullptr) == Value::DRAW);
-  ASSERT(lookup_compressed(ctb, 249, nullptr) == Value::DRAW);
-  ASSERT(lookup_compressed(ctb, 250, nullptr) == Value::WIN);
-  ASSERT(lookup_compressed(ctb, 299, nullptr) == Value::WIN);
+  ASSERT(lookup_compressed(ctb, 0) == Value::WIN);
+  ASSERT(lookup_compressed(ctb, 50) == Value::WIN);
+  ASSERT(lookup_compressed(ctb, 99) == Value::WIN);
+  ASSERT(lookup_compressed(ctb, 100) == Value::LOSS);
+  ASSERT(lookup_compressed(ctb, 125) == Value::LOSS);
+  ASSERT(lookup_compressed(ctb, 149) == Value::LOSS);
+  ASSERT(lookup_compressed(ctb, 150) == Value::DRAW);
+  ASSERT(lookup_compressed(ctb, 200) == Value::DRAW);
+  ASSERT(lookup_compressed(ctb, 249) == Value::DRAW);
+  ASSERT(lookup_compressed(ctb, 250) == Value::WIN);
+  ASSERT(lookup_compressed(ctb, 299) == Value::WIN);
 }
 
 TEST(rle_best_selection) {
@@ -1440,10 +1366,9 @@ TEST(compressed_file_roundtrip) {
   ASSERT(loaded.material == ctb.material);
 
   // Verify all values match using lookup_compressed_with_search
-  BlockCache cache(4);
   for (std::size_t i = 0; i < original.size(); ++i) {
     Board b = index_to_board(i, m);
-    Value looked_up = lookup_compressed_with_search(b, loaded, &cache);
+    Value looked_up = lookup_compressed_with_search(b, loaded);
     ASSERT(looked_up == original[i]);
   }
 
@@ -1476,12 +1401,12 @@ TEST(compressed_lookup_non_tense_positions) {
       tense_count++;
       // Tense positions may have modified stored values, but
       // lookup_compressed_with_search should still return correct result
-      Value looked_up = lookup_compressed_with_search(b, ctb, nullptr);
+      Value looked_up = lookup_compressed_with_search(b, ctb);
       ASSERT(looked_up == original[i]);
     } else {
       non_tense_count++;
       // Non-tense positions MUST have correct stored values
-      Value stored = lookup_compressed(ctb, i, nullptr);
+      Value stored = lookup_compressed(ctb, i);
       ASSERT(stored == original[i]);
     }
   }
@@ -1518,7 +1443,7 @@ TEST(compressed_multiple_materials) {
 
       // Only check non-tense positions (they must have correct stored values)
       if (!has_captures(b)) {
-        Value stored = lookup_compressed(ctb, i, nullptr);
+        Value stored = lookup_compressed(ctb, i);
         ASSERT(stored == original[i]);
       }
     }
@@ -1600,9 +1525,7 @@ int main() {
   RUN_TEST(raw_2bit_expected_size);
   RUN_TEST(compress_block_best_selects_smallest);
   RUN_TEST(block_indexing);
-  RUN_TEST(lru_cache_eviction);
   RUN_TEST(compress_tablebase_roundtrip);
-  RUN_TEST(compressed_lookup_with_cache);
   RUN_TEST(block_compression_stats);
   RUN_TEST(compression_ratio_vs_raw);
 
