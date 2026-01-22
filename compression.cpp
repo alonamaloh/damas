@@ -2129,80 +2129,196 @@ const CompressedTablebase* CompressedTablebaseManager::get_tablebase(const Mater
   return load_or_get(m, false);
 }
 
+// Iterative minimax search through capture chains
+// Uses explicit stack to avoid stack overflow on deep capture sequences
 Value CompressedTablebaseManager::search_through_captures(
     const Board& b,
     std::unordered_set<std::uint64_t>& visited,
-    int depth) {
+    int /*depth*/) {
 
-  // Depth limit to prevent stack overflow
-  if (depth > 100) {
-    return Value::DRAW;
-  }
+  // Node limit to prevent exponential blowup
+  constexpr int MAX_NODES = 10000;
+  int nodes_visited = 0;
 
-  // Check for cycle (repetition = draw)
-  std::uint64_t hash = b.hash();
-  if (visited.count(hash)) {
-    return Value::DRAW;
-  }
+  // Stack frame for iterative minimax
+  struct Frame {
+    Board board;
+    std::vector<Move> moves;
+    std::size_t move_idx;
+    bool has_draw;
+    bool has_unknown;
+    std::uint64_t hash;
+  };
 
-  // Mark as visited for cycle detection
-  visited.insert(hash);
+  std::vector<Frame> stack;
+  stack.reserve(64);
 
-  // Generate moves (must be captures in tense position)
-  std::vector<Move> moves;
-  generateMoves(b, moves);
-
-  // No moves = loss
-  if (moves.empty()) {
-    visited.erase(hash);
-    return Value::LOSS;
-  }
-
-  // Minimax through captures
-  bool has_draw = false;
-  bool has_unknown = false;
-
-  for (const Move& move : moves) {
-    Board next = makeMove(b, move);
-
-    // Terminal check: if opponent has no pieces, we win
-    if (next.white == 0) {
-      visited.erase(hash);
-      return Value::WIN;
+  // Initialize root frame
+  {
+    std::uint64_t hash = b.hash();
+    if (visited.count(hash)) {
+      return Value::DRAW;  // Cycle at root
     }
 
-    // Recursively look up the successor value
-    Value successor_value = lookup_with_search(next, visited, depth + 1);
+    std::vector<Move> moves;
+    generateMoves(b, moves);
 
-    // If opponent loses, we win
-    if (successor_value == Value::LOSS) {
-      visited.erase(hash);
-      return Value::WIN;
+    if (moves.empty()) {
+      return Value::LOSS;  // No moves at root
     }
 
-    if (successor_value == Value::DRAW) {
-      has_draw = true;
-    }
-
-    if (successor_value == Value::UNKNOWN) {
-      has_unknown = true;
-    }
+    visited.insert(hash);
+    stack.push_back({b, std::move(moves), 0, false, false, hash});
   }
 
-  visited.erase(hash);
+  Value pending_result = Value::UNKNOWN;  // Result from child to propagate up
+  bool have_pending = false;
 
-  // If any successor is unknown, we can't determine the result
-  if (has_unknown) {
-    return Value::UNKNOWN;
+  while (!stack.empty()) {
+    Frame& frame = stack.back();
+
+    // Check node limit
+    if (++nodes_visited > MAX_NODES) {
+      // Clean up visited set and return DRAW (conservative)
+      for (auto& f : stack) {
+        visited.erase(f.hash);
+      }
+      return Value::DRAW;
+    }
+
+    // Process pending result from child
+    if (have_pending) {
+      have_pending = false;
+
+      // If opponent loses, we win (alpha-beta cutoff)
+      if (pending_result == Value::LOSS) {
+        visited.erase(frame.hash);
+        stack.pop_back();
+        pending_result = Value::WIN;
+        have_pending = true;
+        continue;
+      }
+
+      if (pending_result == Value::DRAW) {
+        frame.has_draw = true;
+      }
+      if (pending_result == Value::UNKNOWN) {
+        frame.has_unknown = true;
+      }
+
+      frame.move_idx++;
+    }
+
+    // Process remaining moves
+    while (frame.move_idx < frame.moves.size()) {
+      const Move& move = frame.moves[frame.move_idx];
+      Board next = makeMove(frame.board, move);
+
+      // Terminal check: opponent has no pieces = we win
+      if (next.white == 0) {
+        visited.erase(frame.hash);
+        stack.pop_back();
+        pending_result = Value::WIN;
+        have_pending = true;
+        goto continue_outer;
+      }
+
+      Material m = get_material(next);
+
+      // Terminal: opponent has no pieces (after material check)
+      if (m.white_pieces() == 0) {
+        pending_result = Value::LOSS;
+        have_pending = true;
+        break;  // Will process in next iteration
+      }
+
+      // Check cycle
+      std::uint64_t next_hash = next.hash();
+      if (visited.count(next_hash)) {
+        // Cycle = draw for this branch
+        frame.has_draw = true;
+        frame.move_idx++;
+        continue;
+      }
+
+      // Try to get tablebase for this material
+      CompressedTablebase* tb = load_or_get(m, true);
+      if (!tb) {
+        frame.has_unknown = true;
+        frame.move_idx++;
+        continue;
+      }
+
+      // If quiet position, lookup directly
+      if (!has_captures(next)) {
+        std::size_t idx = board_to_index(next, m);
+        Value val = lookup_compressed(*tb, idx, &block_cache_);
+
+        if (val == Value::LOSS) {
+          // Opponent loses = we win (cutoff)
+          visited.erase(frame.hash);
+          stack.pop_back();
+          pending_result = Value::WIN;
+          have_pending = true;
+          goto continue_outer;
+        }
+
+        if (val == Value::DRAW) frame.has_draw = true;
+        if (val == Value::UNKNOWN) frame.has_unknown = true;
+        frame.move_idx++;
+        continue;
+      }
+
+      // Tense position - need to push new frame (depth check)
+      if (static_cast<int>(stack.size()) >= 50) {
+        // Depth limit - treat as draw
+        frame.has_draw = true;
+        frame.move_idx++;
+        continue;
+      }
+
+      // Generate moves for successor
+      std::vector<Move> next_moves;
+      generateMoves(next, next_moves);
+
+      if (next_moves.empty()) {
+        // Opponent has no moves = opponent loses = we win
+        visited.erase(frame.hash);
+        stack.pop_back();
+        pending_result = Value::WIN;
+        have_pending = true;
+        goto continue_outer;
+      }
+
+      // Push new frame
+      visited.insert(next_hash);
+      stack.push_back({next, std::move(next_moves), 0, false, false, next_hash});
+      goto continue_outer;
+    }
+
+    // All moves processed for this frame
+    visited.erase(frame.hash);
+    stack.pop_back();
+
+    if (frame.has_unknown) {
+      pending_result = Value::UNKNOWN;
+    } else if (frame.has_draw) {
+      pending_result = Value::DRAW;
+    } else {
+      pending_result = Value::LOSS;  // All successors were wins for opponent
+    }
+    have_pending = true;
+
+continue_outer:;
   }
 
-  return has_draw ? Value::DRAW : Value::LOSS;
+  return have_pending ? pending_result : Value::UNKNOWN;
 }
 
 Value CompressedTablebaseManager::lookup_with_search(
     const Board& b,
     std::unordered_set<std::uint64_t>& visited,
-    int depth) {
+    int /*depth*/) {
 
   Material m = get_material(b);
 
@@ -2223,7 +2339,7 @@ Value CompressedTablebaseManager::lookup_with_search(
   }
 
   // Tense position - search through captures
-  return search_through_captures(b, visited, depth);
+  return search_through_captures(b, visited, 0);
 }
 
 Value CompressedTablebaseManager::lookup_wdl(const Board& board) {
