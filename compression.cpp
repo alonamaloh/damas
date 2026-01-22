@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 
 // Forward declarations for optimized 2-value RLE
 std::vector<std::uint8_t> compress_rle_huffman_2val(const Value* values, std::size_t count);
@@ -2106,6 +2107,18 @@ CompressedTablebase* CompressedTablebaseManager::load_or_get(const Material& m) 
                 m.white_queens, m.black_queens);
 
   CompressedTablebase tb = load_compressed_tablebase(filename);
+
+  // Warn once if tablebase is missing (for debugging dependency issues)
+  if (tb.empty()) {
+    static std::unordered_set<Material> warned;
+    static std::mutex warn_mutex;
+    std::lock_guard<std::mutex> lock(warn_mutex);
+    if (warned.find(m) == warned.end()) {
+      warned.insert(m);
+      std::cerr << "\n  WARNING: Missing dependency tablebase: " << filename << std::endl;
+    }
+  }
+
   tb_cache_[m] = std::move(tb);
 
   return tb_cache_[m].empty() ? nullptr : &tb_cache_[m];
