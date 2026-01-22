@@ -465,6 +465,85 @@ TEST(has_captures_queen) {
   ASSERT(has_captures(b));
 }
 
+TEST(has_captures_queen_blocked_by_friendly) {
+  // White queens at 1 and 10, Black queen at 5
+  // Diagonal from 1: 1 -> 5 -> 10 -> 14 -> 19 -> 23
+  // The queen at 1 cannot capture the black queen at 5 because the landing
+  // square (10) is blocked by the other white queen
+  Board b;
+  b.white = (1u << 1) | (1u << 10);
+  b.black = 1u << 5;
+  b.kings = b.white | b.black;
+
+  // has_captures must return false - no valid captures exist
+  ASSERT(!has_captures(b));
+
+  // Verify generateMoves agrees (returns quiet moves, not captures)
+  std::vector<Move> moves;
+  generateMoves(b, moves);
+  for (const auto& m : moves) {
+    ASSERT(m.captures == 0);  // All moves should be quiet
+  }
+}
+
+TEST(has_captures_consistency) {
+  // Verify has_captures correctly predicts whether generateMoves finds captures
+  // Test across many board positions
+  auto check_consistency = [](const Board& b) {
+    bool has_cap = has_captures(b);
+    std::vector<Move> moves;
+    generateMoves(b, moves);
+
+    bool found_capture = false;
+    for (const auto& m : moves) {
+      if (m.captures != 0) {
+        found_capture = true;
+        break;
+      }
+    }
+
+    if (has_cap != found_capture) {
+      std::cerr << "has_captures inconsistency!\n"
+                << "  Board: white=0x" << std::hex << b.white
+                << " black=0x" << b.black << " kings=0x" << b.kings << std::dec
+                << "\n  has_captures=" << has_cap
+                << " found_capture=" << found_capture << "\n";
+      return false;
+    }
+    return true;
+  };
+
+  // Test cases with queens that might have blocked landing squares
+  // 2 white queens, 1 black queen in various configurations
+  for (int w1 = 0; w1 < 32; w1++) {
+    for (int w2 = w1 + 1; w2 < 32; w2++) {
+      for (int bl = 0; bl < 32; bl++) {
+        if (bl == w1 || bl == w2) continue;
+        Board b;
+        b.white = (1u << w1) | (1u << w2);
+        b.black = 1u << bl;
+        b.kings = b.white | b.black;
+        ASSERT(check_consistency(b));
+      }
+    }
+  }
+
+  // Test cases with mixed pawns and queens
+  for (int w1 = 0; w1 < 32; w1++) {
+    for (int w2 = w1 + 1; w2 < 32; w2++) {
+      for (int bl = 0; bl < 32; bl++) {
+        if (bl == w1 || bl == w2) continue;
+        // w1 is queen, w2 is pawn, bl is queen
+        Board b;
+        b.white = (1u << w1) | (1u << w2);
+        b.black = 1u << bl;
+        b.kings = (1u << w1) | b.black;
+        ASSERT(check_consistency(b));
+      }
+    }
+  }
+}
+
 TEST(is_dont_care_we_capture) {
   // Position where we have a capture
   Board b;
@@ -1505,6 +1584,8 @@ int main() {
   RUN_TEST(has_captures_pawn);
   RUN_TEST(has_captures_none);
   RUN_TEST(has_captures_queen);
+  RUN_TEST(has_captures_queen_blocked_by_friendly);
+  RUN_TEST(has_captures_consistency);
   RUN_TEST(is_dont_care_we_capture);
   RUN_TEST(is_dont_care_opponent_captures);
   RUN_TEST(is_dont_care_quiet_position);

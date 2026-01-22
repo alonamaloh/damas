@@ -413,10 +413,10 @@ bool has_captures(const Board& board) {
 
   // Queen captures
   Bb kingOrEmpty = board.whiteQueens() | empty;
-  Bb canBeCapturedNW = board.black & moveSE(kingOrEmpty);
-  Bb canBeCapturedNE = board.black & moveSW(kingOrEmpty);
-  Bb canBeCapturedSE = board.black & moveNW(kingOrEmpty);
-  Bb canBeCapturedSW = board.black & moveNE(kingOrEmpty);
+  Bb canBeCapturedNW = board.black & moveSE(empty);
+  Bb canBeCapturedNE = board.black & moveSW(empty);
+  Bb canBeCapturedSE = board.black & moveNW(empty);
+  Bb canBeCapturedSW = board.black & moveNE(empty);
 
   // Check if any queen can reach a capture position
   Bb queenCanCapture = 0;

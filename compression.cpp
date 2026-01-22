@@ -153,12 +153,35 @@ static inline Value score_to_value(int score) {
 // Negamax search with alpha-beta pruning through don't-care positions.
 // The Lookup callable returns an int score for quiet positions.
 // Template to allow different lookup strategies (uncompressed, compressed, manager).
+// Max depth is bounded by piece count (captures remove pieces), but we add a
+// safety limit to prevent stack overflow from any bugs.
+constexpr int MAX_NEGAMAX_DEPTH = 32;
+
 template<typename Lookup>
 static int negamax(const Board& b, int alpha, int beta, Lookup&& lookup,
-                   SearchStats* stats = nullptr) {
+                   SearchStats* stats = nullptr, int depth = 0) {
   // Quiet position: use the lookup function
   if (!has_captures(b)) {
     return lookup(b);
+  }
+
+  // Safety limit to prevent stack overflow - this should never trigger
+  // with valid positions (max captures = total pieces - 1)
+  if (depth >= MAX_NEGAMAX_DEPTH) {
+    std::cerr << "\nFATAL: negamax depth " << depth << " exceeded limit!\n"
+              << "Board: " << b << "\n"
+              << "Material: " << get_material(b) << "\n"
+              << "has_captures=" << has_captures(b) << "\n";
+    std::vector<Move> dbg_moves;
+    generateMoves(b, dbg_moves);
+    std::cerr << "Generated " << dbg_moves.size() << " moves:\n";
+    for (const auto& mv : dbg_moves) {
+      Board next = makeMove(b, mv);
+      std::cerr << "  Move from_xor_to=0x" << std::hex << mv.from_xor_to
+                << " captures=0x" << mv.captures << std::dec
+                << " -> Material: " << get_material(next) << "\n";
+    }
+    std::exit(1);
   }
 
   // Capture position: search through forced moves
@@ -178,7 +201,7 @@ static int negamax(const Board& b, int alpha, int beta, Lookup&& lookup,
       return SCORE_WIN;
     }
 
-    int score = -negamax(next, -beta, -alpha, lookup, stats);
+    int score = -negamax(next, -beta, -alpha, lookup, stats, depth + 1);
 
     if (score >= beta) {
       return score;  // Beta cutoff
