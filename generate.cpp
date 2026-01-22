@@ -307,8 +307,16 @@ void generate_wdl_parallel(
   std::size_t size_m = material_size(m);
   std::size_t size_fm = symmetric ? 0 : material_size(fm);
 
+  std::cout << "  [1/5] Allocating tables: " << m << " (" << size_m << " pos)";
+  if (!symmetric) std::cout << " + " << fm << " (" << size_fm << " pos)";
+  std::cout << std::endl;
+  std::cout.flush();
+
   std::vector<Value> table_m(size_m, Value::UNKNOWN);
   std::vector<Value> table_fm(size_fm, Value::UNKNOWN);
+
+  std::cout << "  [2/5] Starting iterative solver..." << std::endl;
+  std::cout.flush();
 
   auto start = std::chrono::high_resolution_clock::now();
 
@@ -319,6 +327,10 @@ void generate_wdl_parallel(
   while (changed) {
     changed = false;
     iteration++;
+
+    if (iteration <= 5 || iteration % 10 == 0) {
+      std::cout << "    Iteration " << iteration << "..." << std::flush;
+    }
 
     // Update table_m in parallel
     #pragma omp parallel for schedule(dynamic, 1024) reduction(||:changed)
@@ -345,7 +357,14 @@ void generate_wdl_parallel(
         }
       }
     }
+
+    if (iteration <= 5 || iteration % 10 == 0) {
+      std::cout << " " << (changed ? "changed" : "stable") << std::endl;
+    }
   }
+
+  std::cout << "  [3/5] Marking remaining positions as DRAW..." << std::endl;
+  std::cout.flush();
 
   // Mark remaining as DRAW
   std::size_t wins_m = 0, losses_m = 0, draws_m = 0;
@@ -360,9 +379,12 @@ void generate_wdl_parallel(
   auto end = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
-  std::cout << m << " (" << size_m << " pos): "
+  std::cout << "  [4/5] " << m << " (" << size_m << " pos): "
             << wins_m << "W/" << losses_m << "L/" << draws_m << "D, "
             << iteration << " iters, " << duration.count() << "ms" << std::endl;
+
+  std::cout << "  [5/5] Saving tablebase to disk..." << std::endl;
+  std::cout.flush();
 
   save_tablebase(table_m, m);
   store_wdl_tablebase(m, std::move(table_m));
@@ -398,6 +420,11 @@ void generate_wdl_parallel_compressed(
   std::size_t size_m = material_size(m);
   std::size_t size_fm = symmetric ? 0 : material_size(fm);
 
+  std::cout << "  [1/6] Allocating tables: " << m << " (" << size_m << " pos)";
+  if (!symmetric) std::cout << " + " << fm << " (" << size_fm << " pos)";
+  std::cout << std::endl;
+  std::cout.flush();
+
   std::vector<Value> table_m(size_m, Value::UNKNOWN);
   std::vector<Value> table_fm(size_fm, Value::UNKNOWN);
 
@@ -405,11 +432,17 @@ void generate_wdl_parallel_compressed(
 
   // Create thread-local managers for parallel lookups
   int num_threads = omp_get_max_threads();
+  std::cout << "  [2/6] Creating " << num_threads << " thread-local tablebase managers..." << std::endl;
+  std::cout.flush();
+
   std::vector<std::unique_ptr<CompressedTablebaseManager>> thread_managers;
   for (int i = 0; i < num_threads; ++i) {
     thread_managers.push_back(
         std::make_unique<CompressedTablebaseManager>(tb_directory, 32));
   }
+
+  std::cout << "  [3/6] Starting iterative solver..." << std::endl;
+  std::cout.flush();
 
   // Iterate until stable
   int iteration = 0;
@@ -418,6 +451,10 @@ void generate_wdl_parallel_compressed(
   while (changed) {
     changed = false;
     iteration++;
+
+    if (iteration <= 5 || iteration % 10 == 0) {
+      std::cout << "    Iteration " << iteration << "..." << std::flush;
+    }
 
     // Update table_m in parallel
     #pragma omp parallel for schedule(dynamic, 1024) reduction(||:changed)
@@ -446,7 +483,14 @@ void generate_wdl_parallel_compressed(
         }
       }
     }
+
+    if (iteration <= 5 || iteration % 10 == 0) {
+      std::cout << " " << (changed ? "changed" : "stable") << std::endl;
+    }
   }
+
+  std::cout << "  [4/6] Marking remaining positions as DRAW..." << std::endl;
+  std::cout.flush();
 
   // Mark remaining as DRAW
   std::size_t wins_m = 0, losses_m = 0, draws_m = 0;
@@ -461,9 +505,12 @@ void generate_wdl_parallel_compressed(
   auto end = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
-  std::cout << m << " (" << size_m << " pos): "
+  std::cout << "  [5/6] " << m << " (" << size_m << " pos): "
             << wins_m << "W/" << losses_m << "L/" << draws_m << "D, "
             << iteration << " iters, " << duration.count() << "ms" << std::endl;
+
+  std::cout << "  [6/6] Compressing and saving..." << std::endl;
+  std::cout.flush();
 
   // Mark don't-care positions and compress
   CompressionStats cstats;
@@ -1174,6 +1221,13 @@ void solve_all_parallel(int max_pieces, bool load_existing = false) {
       }
     }
 
+    std::cout << "\n" << m;
+    if (!(f == m)) std::cout << " <-> " << f;
+    std::cout << " (" << m.total_pieces() << " pieces)" << std::endl;
+
+    std::cout << "  Loading dependencies..." << std::endl;
+    std::cout.flush();
+
     // Build dependency tablebases for this material
     std::vector<Material> deps = get_sub_materials(m);
     std::unordered_map<Material, std::vector<Value>> dep_tables;
@@ -1190,6 +1244,10 @@ void solve_all_parallel(int max_pieces, bool load_existing = false) {
         dep_tables[dep] = std::move(tb);
       }
     }
+
+    std::cout << "  Loaded " << dep_tables.size() << " dependency tablebases" << std::endl;
+    std::cout << "  Verifying dependencies..." << std::endl;
+    std::cout.flush();
 
     // Verify dependencies
     verify_dependencies(m, deps, dep_tables);
@@ -1309,12 +1367,21 @@ void solve_all_parallel_compressed(int max_pieces, int threshold, const std::str
 
     if (m.total_pieces() >= threshold) {
       // Large endgame: use compressed mode
-      std::cout << "\n[COMPRESSED] ";
+      std::cout << "\n[COMPRESSED] " << m;
+      if (!(f == m)) std::cout << " <-> " << f;
+      std::cout << " (" << m.total_pieces() << " pieces)" << std::endl;
       generate_wdl_parallel_compressed(m, tb_directory);
       // Force reload of the manager cache after new tablebase is saved
       check_manager.clear();
     } else {
       // Small endgame: use traditional method + save compressed copy
+      std::cout << "\n[TRADITIONAL] " << m;
+      if (!(f == m)) std::cout << " <-> " << f;
+      std::cout << " (" << m.total_pieces() << " pieces)" << std::endl;
+
+      std::cout << "  Loading dependencies..." << std::endl;
+      std::cout.flush();
+
       std::vector<Material> deps = get_sub_materials(m);
       std::unordered_map<Material, std::vector<Value>> dep_tables;
 
@@ -1329,6 +1396,10 @@ void solve_all_parallel_compressed(int max_pieces, int threshold, const std::str
           dep_tables[dep] = std::move(tb);
         }
       }
+
+      std::cout << "  Loaded " << dep_tables.size() << " dependency tablebases" << std::endl;
+      std::cout << "  Verifying dependencies..." << std::endl;
+      std::cout.flush();
 
       // Verify dependencies
       verify_dependencies(m, deps, dep_tables);
