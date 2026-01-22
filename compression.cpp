@@ -759,8 +759,11 @@ const std::vector<Value>* BlockCache::get_or_decompress(
     std::uint32_t block_idx,
     const CompressedTablebase& tb) {
 
+  // Build cache key from material and block index
+  BlockCacheKey key{tb.material, block_idx};
+
   // Check if already in cache
-  auto it = cache_map_.find(block_idx);
+  auto it = cache_map_.find(key);
   if (it != cache_map_.end()) {
     // Cache hit - move to front
     hits_++;
@@ -801,8 +804,8 @@ const std::vector<Value>* BlockCache::get_or_decompress(
   }
 
   // Insert at front
-  lru_list_.emplace_front(block_idx, std::move(decompressed));
-  cache_map_[block_idx] = lru_list_.begin();
+  lru_list_.emplace_front(key, std::move(decompressed));
+  cache_map_[key] = lru_list_.begin();
 
   return &lru_list_.front().second;
 }
@@ -2534,4 +2537,143 @@ CompressedTablebase load_compressed_tablebase(const std::string& filename) {
   }
 
   return tb;
+}
+
+// ============================================================================
+// CompressedTablebaseManager Implementation (Public API)
+// ============================================================================
+
+CompressedTablebaseManager::CompressedTablebaseManager(const std::string& directory,
+                                                       std::size_t block_cache_size)
+    : directory_(directory), block_cache_(block_cache_size) {}
+
+void CompressedTablebaseManager::clear() {
+  tb_cache_.clear();
+  block_cache_.clear();
+}
+
+CompressedTablebase* CompressedTablebaseManager::load_or_get(const Material& m) {
+  auto it = tb_cache_.find(m);
+  if (it != tb_cache_.end()) {
+    return it->second.empty() ? nullptr : &it->second;
+  }
+
+  // Build filename: cwdl_BBWWKK.bin
+  char filename[256];
+  std::snprintf(filename, sizeof(filename), "%s/cwdl_%d%d%d%d%d%d.bin",
+                directory_.c_str(),
+                m.back_white_pawns, m.back_black_pawns,
+                m.other_white_pawns, m.other_black_pawns,
+                m.white_queens, m.black_queens);
+
+  CompressedTablebase tb = load_compressed_tablebase(filename);
+  tb_cache_[m] = std::move(tb);
+
+  return tb_cache_[m].empty() ? nullptr : &tb_cache_[m];
+}
+
+const CompressedTablebase* CompressedTablebaseManager::get_tablebase(const Material& m) {
+  return load_or_get(m);
+}
+
+Value CompressedTablebaseManager::search_through_captures(
+    const Board& b,
+    std::unordered_set<std::uint64_t>& visited,
+    int depth) {
+
+  // Depth limit to prevent stack overflow
+  if (depth > 100) {
+    return Value::DRAW;
+  }
+
+  // Check for cycle (repetition = draw)
+  std::uint64_t hash = b.hash();
+  if (visited.count(hash)) {
+    return Value::DRAW;
+  }
+
+  // Mark as visited for cycle detection
+  visited.insert(hash);
+
+  // Generate moves (must be captures in tense position)
+  std::vector<Move> moves;
+  generateMoves(b, moves);
+
+  // No moves = loss
+  if (moves.empty()) {
+    visited.erase(hash);
+    return Value::LOSS;
+  }
+
+  // Minimax through captures
+  bool has_draw = false;
+  bool has_unknown = false;
+
+  for (const Move& move : moves) {
+    Board next = makeMove(b, move);
+
+    // Terminal check: if opponent has no pieces, we win
+    if (next.white == 0) {
+      visited.erase(hash);
+      return Value::WIN;
+    }
+
+    // Recursively look up the successor value
+    Value successor_value = lookup_with_search(next, visited, depth + 1);
+
+    // If opponent loses, we win
+    if (successor_value == Value::LOSS) {
+      visited.erase(hash);
+      return Value::WIN;
+    }
+
+    if (successor_value == Value::DRAW) {
+      has_draw = true;
+    }
+
+    if (successor_value == Value::UNKNOWN) {
+      has_unknown = true;
+    }
+  }
+
+  visited.erase(hash);
+
+  // If any successor is unknown, we can't determine the result
+  if (has_unknown) {
+    return Value::UNKNOWN;
+  }
+
+  return has_draw ? Value::DRAW : Value::LOSS;
+}
+
+Value CompressedTablebaseManager::lookup_with_search(
+    const Board& b,
+    std::unordered_set<std::uint64_t>& visited,
+    int depth) {
+
+  Material m = get_material(b);
+
+  // Terminal: opponent has no pieces
+  if (m.white_pieces() == 0) {
+    return Value::LOSS;  // From opponent's perspective after flip
+  }
+
+  CompressedTablebase* tb = load_or_get(m);
+  if (!tb) {
+    return Value::UNKNOWN;
+  }
+
+  // If not a tense position, return the stored value directly
+  if (!has_captures(b)) {
+    std::size_t idx = board_to_index(b, m);
+    return lookup_compressed(*tb, idx, &block_cache_);
+  }
+
+  // Tense position - search through captures
+  return search_through_captures(b, visited, depth);
+}
+
+Value CompressedTablebaseManager::lookup_wdl(const Board& board) {
+  std::unordered_set<std::uint64_t> visited;
+  return lookup_with_search(board, visited, 0);
 }

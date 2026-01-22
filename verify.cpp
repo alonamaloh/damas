@@ -1,240 +1,133 @@
+// Tablebase verification tool
+//
+// Verifies that each position's stored value equals the minimax of its successors.
+// For WDL: WIN if any successor is LOSS, LOSS if all successors WIN, else DRAW.
+// For DTM: WIN in N = 1 + min(opponent's loss depth), LOSS in N = max(opponent's win depth).
+
 #include "tablebase.h"
 #include "board.h"
 #include "movegen.h"
 #include <iostream>
 #include <vector>
 #include <unordered_map>
+#include <algorithm>
 #include <cstring>
 
 namespace {
 
-// Cache loaded tablebases
+// ---------------------------------------------------------------------------
+// Tablebase cache
+// ---------------------------------------------------------------------------
+
 std::unordered_map<Material, std::vector<Value>> wdl_cache;
 std::unordered_map<Material, std::vector<DTM>> dtm_cache;
 
-// Get WDL value for a position (load if needed)
-Value lookup_wdl(const Board& b) {
+Value get_wdl(const Board& b) {
   Material m = get_material(b);
-  if (wdl_cache.find(m) == wdl_cache.end()) {
+
+  // Terminal capture: opponent has no pieces
+  if (m.white_pieces() == 0) return Value::LOSS;
+
+  auto it = wdl_cache.find(m);
+  if (it == wdl_cache.end()) {
     wdl_cache[m] = load_tablebase(m);
+    it = wdl_cache.find(m);
   }
-  auto& tb = wdl_cache[m];
-  if (tb.empty()) return Value::UNKNOWN;
+
+  if (it->second.empty()) return Value::UNKNOWN;
   std::size_t idx = board_to_index(b, m);
-  if (idx >= tb.size()) return Value::UNKNOWN;
-  return tb[idx];
+  return idx < it->second.size() ? it->second[idx] : Value::UNKNOWN;
 }
 
-// Get DTM value for a position (load if needed)
-DTM lookup_dtm(const Board& b) {
+DTM get_dtm(const Board& b) {
   Material m = get_material(b);
-  if (dtm_cache.find(m) == dtm_cache.end()) {
+
+  // Terminal capture
+  if (m.white_pieces() == 0) return DTM_LOSS_TERMINAL;
+
+  auto it = dtm_cache.find(m);
+  if (it == dtm_cache.end()) {
     dtm_cache[m] = load_dtm(m);
+    it = dtm_cache.find(m);
   }
-  auto& tb = dtm_cache[m];
-  if (tb.empty()) return DTM_UNKNOWN;
+
+  if (it->second.empty()) return DTM_UNKNOWN;
   std::size_t idx = board_to_index(b, m);
-  if (idx >= tb.size()) return DTM_UNKNOWN;
-  return tb[idx];
+  return idx < it->second.size() ? it->second[idx] : DTM_UNKNOWN;
 }
 
-// Convert Value to string for error reporting
-const char* value_to_string(Value v) {
-  switch (v) {
-    case Value::UNKNOWN: return "UNKNOWN";
-    case Value::WIN: return "WIN";
-    case Value::LOSS: return "LOSS";
-    case Value::DRAW: return "DRAW";
-    default: return "?";
-  }
-}
+// ---------------------------------------------------------------------------
+// Minimax computation
+// ---------------------------------------------------------------------------
 
-// Print board for error reporting
-void print_board(const Board& b) {
-  std::cout << "    White: 0x" << std::hex << b.white << std::dec << std::endl;
-  std::cout << "    Black: 0x" << std::hex << b.black << std::dec << std::endl;
-  std::cout << "    Kings: 0x" << std::hex << b.kings << std::dec << std::endl;
-}
-
-// Verify a single position
-// Returns true if position is consistent, false if error found
-bool verify_position(const Board& board, Value expected_wdl, DTM expected_dtm,
-                     const Material& /*m*/, std::size_t idx, bool verbose) {
+Value compute_wdl(const Board& board) {
   std::vector<Move> moves;
   generateMoves(board, moves);
 
-  // Terminal position check (no legal moves)
-  if (moves.empty()) {
-    bool wdl_ok = (expected_wdl == Value::LOSS);
-    bool dtm_ok = (expected_dtm == DTM_LOSS_TERMINAL);
+  if (moves.empty()) return Value::LOSS;
 
-    if (!wdl_ok || !dtm_ok) {
-      if (verbose) {
-        std::cout << "  ERROR at index " << idx << " (terminal position):" << std::endl;
-        print_board(board);
-        std::cout << "    Expected: WDL=" << value_to_string(Value::LOSS)
-                  << " DTM=" << DTM_LOSS_TERMINAL << std::endl;
-        std::cout << "    Got: WDL=" << value_to_string(expected_wdl)
-                  << " DTM=" << expected_dtm << std::endl;
-      }
-      return false;
-    }
-    return true;
-  }
-
-  // Collect successor values
-  bool found_loss = false;
-  bool all_wins = true;
-  DTM best_opp_loss = DTM_UNKNOWN;  // For WIN verification (highest LOSS DTM)
-  DTM best_opp_win = DTM_UNKNOWN;   // For LOSS verification (highest WIN DTM)
+  bool dominated = true;  // All successors are WIN (opponent wins all)
 
   for (const Move& move : moves) {
-    Board next = makeMove(board, move);
-    Value succ_wdl = lookup_wdl(next);
-    DTM succ_dtm = lookup_dtm(next);
-
-    // Handle terminal captures (opponent has no pieces)
-    Material next_m = get_material(next);
-    if (next_m.white_pieces() == 0) {
-      // After makeMove, board is flipped, so "white" having 0 pieces means
-      // the side to move (opponent from our perspective) has lost
-      succ_wdl = Value::LOSS;
-      succ_dtm = DTM_LOSS_TERMINAL;
-    }
-
-    if (succ_wdl == Value::LOSS) {
-      found_loss = true;
-      // Track quickest loss for opponent (we want fastest win)
-      // DTM_LOSS_TERMINAL (-128) = 0 moves, is best
-      // Otherwise, highest (least negative) = fewest moves
-      if (succ_dtm != DTM_UNKNOWN) {
-        if (best_opp_loss == DTM_UNKNOWN) {
-          best_opp_loss = succ_dtm;
-        } else if (succ_dtm == DTM_LOSS_TERMINAL) {
-          best_opp_loss = DTM_LOSS_TERMINAL;  // Terminal is always fastest
-        } else if (best_opp_loss != DTM_LOSS_TERMINAL && succ_dtm > best_opp_loss) {
-          best_opp_loss = succ_dtm;
-        }
-      }
-    }
-    if (succ_wdl != Value::WIN) {
-      all_wins = false;
-    }
-    if (succ_wdl == Value::WIN && succ_dtm > 0) {
-      // Track highest (largest) WIN DTM for LOSS verification
-      if (best_opp_win == DTM_UNKNOWN || succ_dtm > best_opp_win) {
-        best_opp_win = succ_dtm;
-      }
-    }
+    Value v = get_wdl(makeMove(board, move));
+    if (v == Value::LOSS) return Value::WIN;  // Found winning move
+    if (v != Value::WIN) dominated = false;
   }
 
-  // Verify WDL
-  Value computed_wdl;
-  if (found_loss) {
-    computed_wdl = Value::WIN;
-  } else if (all_wins) {
-    computed_wdl = Value::LOSS;
-  } else {
-    computed_wdl = Value::DRAW;
-  }
-
-  if (computed_wdl != expected_wdl) {
-    if (verbose) {
-      std::cout << "  WDL ERROR at index " << idx << ":" << std::endl;
-      print_board(board);
-      std::cout << "    Expected WDL: " << value_to_string(expected_wdl) << std::endl;
-      std::cout << "    Computed WDL: " << value_to_string(computed_wdl) << std::endl;
-      std::cout << "    found_loss=" << found_loss << " all_wins=" << all_wins << std::endl;
-      std::cout << "    Successor values:" << std::endl;
-      for (const Move& move : moves) {
-        Board next = makeMove(board, move);
-        Material nm = get_material(next);
-        Value sv = lookup_wdl(next);
-        DTM sd = lookup_dtm(next);
-        // Apply terminal check for display
-        if (nm.white_pieces() == 0) {
-          sv = Value::LOSS;
-          sd = DTM_LOSS_TERMINAL;
-        }
-        std::cout << "      -> " << value_to_string(sv) << " DTM=" << sd
-                  << " (mat=" << nm << " wp=" << nm.white_pieces() << ")" << std::endl;
-      }
-    }
-    return false;
-  }
-
-  // Verify DTM
-  DTM expected_computed_dtm;
-  if (expected_wdl == Value::DRAW) {
-    expected_computed_dtm = DTM_DRAW;
-  } else if (expected_wdl == Value::WIN) {
-    // WIN in (opponent's quickest loss moves + 1) moves
-    // Opponent's quickest loss = highest negative DTM (least negative = fewest moves)
-    if (best_opp_loss == DTM_UNKNOWN) {
-      // Should not happen if WDL is correct
-      if (verbose) {
-        std::cout << "  DTM ERROR at index " << idx << ": WIN but no LOSS successor found" << std::endl;
-      }
-      return false;
-    }
-    int opp_moves = (best_opp_loss == DTM_LOSS_TERMINAL) ? 0 : -best_opp_loss;
-    expected_computed_dtm = dtm_win(opp_moves + 1);
-  } else {  // LOSS
-    // LOSS in (opponent's slowest win) moves
-    // Opponent's slowest win = highest positive DTM
-    if (best_opp_win == DTM_UNKNOWN) {
-      // Should not happen if WDL is correct (all successors are WIN)
-      if (verbose) {
-        std::cout << "  DTM ERROR at index " << idx << ": LOSS but no WIN successor found" << std::endl;
-      }
-      return false;
-    }
-    expected_computed_dtm = dtm_loss(best_opp_win);
-  }
-
-  if (expected_dtm != expected_computed_dtm) {
-    if (verbose) {
-      std::cout << "  DTM ERROR at index " << idx << ":" << std::endl;
-      print_board(board);
-      std::cout << "    WDL: " << value_to_string(expected_wdl) << std::endl;
-      std::cout << "    Expected DTM: " << expected_computed_dtm << std::endl;
-      std::cout << "    Got DTM: " << expected_dtm << std::endl;
-      if (expected_wdl == Value::WIN) {
-        std::cout << "    best_opp_loss=" << best_opp_loss << std::endl;
-      } else {
-        std::cout << "    best_opp_win=" << best_opp_win << std::endl;
-      }
-      std::cout << "    Successor values:" << std::endl;
-      for (const Move& move : moves) {
-        Board next = makeMove(board, move);
-        Value sv = lookup_wdl(next);
-        DTM sd = lookup_dtm(next);
-        std::cout << "      -> " << value_to_string(sv) << " DTM=" << sd << std::endl;
-      }
-    }
-    return false;
-  }
-
-  return true;
+  return dominated ? Value::LOSS : Value::DRAW;
 }
 
-// Generate all material configurations with up to n total pieces
+DTM compute_dtm(const Board& board, Value wdl) {
+  if (wdl == Value::DRAW) return DTM_DRAW;
+
+  std::vector<Move> moves;
+  generateMoves(board, moves);
+
+  if (moves.empty()) return DTM_LOSS_TERMINAL;
+
+  if (wdl == Value::WIN) {
+    // Find quickest win: minimize opponent's loss depth
+    DTM best = DTM_UNKNOWN;
+    for (const Move& move : moves) {
+      Board next = makeMove(board, move);
+      if (get_wdl(next) == Value::LOSS) {
+        DTM d = get_dtm(next);
+        if (d == DTM_LOSS_TERMINAL) return dtm_win(1);  // Immediate capture
+        if (best == DTM_UNKNOWN || d > best) best = d;  // Less negative = faster
+      }
+    }
+    return best == DTM_UNKNOWN ? DTM_UNKNOWN : dtm_win(1 - best);
+  }
+
+  // LOSS: opponent's slowest win (maximize opponent's win depth)
+  DTM worst = DTM_UNKNOWN;
+  for (const Move& move : moves) {
+    DTM d = get_dtm(makeMove(board, move));
+    if (d > 0 && (worst == DTM_UNKNOWN || d > worst)) worst = d;
+  }
+  return worst == DTM_UNKNOWN ? DTM_UNKNOWN : dtm_loss(worst);
+}
+
+// ---------------------------------------------------------------------------
+// Material enumeration
+// ---------------------------------------------------------------------------
+
 std::vector<Material> all_materials(int max_pieces) {
   std::vector<Material> result;
 
-  for (int total = 2; total <= max_pieces; ++total) {
-    for (int bwp = 0; bwp <= std::min(4, total - 1); ++bwp) {
-      for (int bbp = 0; bbp <= std::min(4, total - bwp - 1); ++bbp) {
-        for (int owp = 0; owp <= std::min(24, total - bwp - bbp - 1); ++owp) {
-          for (int obp = 0; obp <= std::min(24 - owp, total - bwp - bbp - owp - 1); ++obp) {
-            int remaining = total - bwp - bbp - owp - obp;
-            for (int wq = 0; wq <= remaining; ++wq) {
-              int bq = remaining - wq;
-              if (bq >= 0) {
-                Material m{bwp, bbp, owp, obp, wq, bq};
-                if (m.white_pieces() > 0 && m.black_pieces() > 0) {
-                  result.push_back(m);
-                }
+  for (int n = 2; n <= max_pieces; ++n) {
+    // Enumerate all distributions of n pieces across 6 categories:
+    // back_white_pawns, back_black_pawns, other_white_pawns, other_black_pawns,
+    // white_queens, black_queens
+    for (int bwp = 0; bwp <= std::min(4, n); ++bwp) {
+      for (int bbp = 0; bbp <= std::min(4, n - bwp); ++bbp) {
+        for (int owp = 0; owp <= std::min(24, n - bwp - bbp); ++owp) {
+          for (int obp = 0; obp <= std::min(24 - owp, n - bwp - bbp - owp); ++obp) {
+            int queens = n - bwp - bbp - owp - obp;
+            for (int wq = 0; wq <= queens; ++wq) {
+              Material m{bwp, bbp, owp, obp, wq, queens - wq};
+              if (m.white_pieces() > 0 && m.black_pieces() > 0) {
+                result.push_back(m);
               }
             }
           }
@@ -246,201 +139,187 @@ std::vector<Material> all_materials(int max_pieces) {
   return result;
 }
 
-void print_usage(const char* program) {
-  std::cerr << "Usage: " << program << " [options] <max_pieces>" << std::endl;
-  std::cerr << std::endl;
-  std::cerr << "Options:" << std::endl;
-  std::cerr << "  -v, --verbose    Show detailed error information" << std::endl;
-  std::cerr << "  --wdl-only       Only verify WDL (skip DTM verification)" << std::endl;
-  std::cerr << std::endl;
-  std::cerr << "Verifies all tablebases up to max_pieces (2-8)." << std::endl;
-  std::cerr << "Checks that each position's value is consistent with its successors." << std::endl;
+// ---------------------------------------------------------------------------
+// Verification
+// ---------------------------------------------------------------------------
+
+struct Errors {
+  std::size_t wdl = 0;
+  std::size_t dtm = 0;
+};
+
+const char* name(Value v) {
+  switch (v) {
+    case Value::WIN:  return "WIN";
+    case Value::LOSS: return "LOSS";
+    case Value::DRAW: return "DRAW";
+    default:          return "UNKNOWN";
+  }
+}
+
+void show_error(const Board& b, std::size_t idx,
+                Value stored_wdl, Value computed_wdl,
+                DTM stored_dtm, DTM computed_dtm) {
+  std::cout << "  ERROR at index " << idx << ":\n";
+  std::cout << "    White: 0x" << std::hex << b.white << std::dec << "\n";
+  std::cout << "    Black: 0x" << std::hex << b.black << std::dec << "\n";
+  std::cout << "    Kings: 0x" << std::hex << b.kings << std::dec << "\n";
+
+  if (stored_wdl != computed_wdl) {
+    std::cout << "    WDL: stored=" << name(stored_wdl)
+              << " computed=" << name(computed_wdl) << "\n";
+  }
+  if (stored_dtm != computed_dtm) {
+    std::cout << "    DTM: stored=" << stored_dtm
+              << " computed=" << computed_dtm << "\n";
+  }
+
+  std::cout << "    Successors:\n";
+  std::vector<Move> moves;
+  generateMoves(b, moves);
+  for (const Move& move : moves) {
+    Board next = makeMove(b, move);
+    std::cout << "      -> " << name(get_wdl(next))
+              << " DTM=" << get_dtm(next) << "\n";
+  }
+}
+
+Errors verify(const Material& m, bool check_dtm, bool verbose) {
+  Errors errors;
+
+  std::vector<Value> wdl = load_tablebase(m);
+  if (wdl.empty()) return errors;
+  wdl_cache[m] = wdl;
+
+  std::vector<DTM> dtm;
+  if (check_dtm) {
+    dtm = load_dtm(m);
+    if (dtm.empty()) return errors;
+    dtm_cache[m] = dtm;
+  }
+
+  std::size_t size = material_size(m);
+
+  for (std::size_t idx = 0; idx < size; ++idx) {
+    Board board = index_to_board(idx, m);
+
+    Value stored_wdl = wdl[idx];
+    Value computed_wdl = compute_wdl(board);
+
+    DTM stored_dtm = check_dtm ? dtm[idx] : DTM_DRAW;
+    DTM computed_dtm = check_dtm ? compute_dtm(board, stored_wdl) : DTM_DRAW;
+
+    bool wdl_ok = (stored_wdl == computed_wdl);
+    bool dtm_ok = !check_dtm || (stored_dtm == computed_dtm);
+
+    if (!wdl_ok) errors.wdl++;
+    if (!dtm_ok) errors.dtm++;
+
+    if (verbose && (!wdl_ok || !dtm_ok)) {
+      show_error(board, idx, stored_wdl, computed_wdl, stored_dtm, computed_dtm);
+    }
+  }
+
+  return errors;
+}
+
+// ---------------------------------------------------------------------------
+// Command-line interface
+// ---------------------------------------------------------------------------
+
+struct Options {
+  int max_pieces = 0;
+  bool verbose = false;
+  bool wdl_only = false;
+};
+
+Options parse_args(int argc, char* argv[]) {
+  Options opts;
+
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "-v") == 0 || std::strcmp(argv[i], "--verbose") == 0) {
+      opts.verbose = true;
+    } else if (std::strcmp(argv[i], "--wdl-only") == 0) {
+      opts.wdl_only = true;
+    } else if (argv[i][0] != '-') {
+      opts.max_pieces = std::atoi(argv[i]);
+    }
+  }
+
+  return opts;
+}
+
+void usage(const char* prog) {
+  std::cerr << "Usage: " << prog << " [options] <max_pieces>\n\n"
+            << "Options:\n"
+            << "  -v, --verbose    Show detailed error information\n"
+            << "  --wdl-only       Only verify WDL (skip DTM verification)\n\n"
+            << "Verifies all tablebases up to max_pieces (2-8).\n";
 }
 
 } // namespace
 
 int main(int argc, char* argv[]) {
-  bool verbose = false;
-  bool wdl_only = false;
-  int max_pieces = 0;
+  Options opts = parse_args(argc, argv);
 
-  // Parse arguments
-  for (int i = 1; i < argc; ++i) {
-    if (std::strcmp(argv[i], "-v") == 0 || std::strcmp(argv[i], "--verbose") == 0) {
-      verbose = true;
-    } else if (std::strcmp(argv[i], "--wdl-only") == 0) {
-      wdl_only = true;
-    } else if (argv[i][0] != '-') {
-      max_pieces = std::atoi(argv[i]);
-    } else {
-      print_usage(argv[0]);
-      return 1;
-    }
-  }
-
-  if (max_pieces < 2 || max_pieces > 8) {
-    print_usage(argv[0]);
+  if (opts.max_pieces < 2 || opts.max_pieces > 8) {
+    usage(argv[0]);
     return 1;
   }
 
-  std::cout << "=== Tablebase Verification ===" << std::endl;
-  std::cout << "Verifying up to " << max_pieces << " pieces" << std::endl;
-  if (wdl_only) {
-    std::cout << "Mode: WDL only" << std::endl;
-  }
-  std::cout << std::endl;
+  std::cout << "=== Tablebase Verification ===\n"
+            << "Verifying up to " << opts.max_pieces << " pieces\n";
+  if (opts.wdl_only) std::cout << "Mode: WDL only\n";
+  std::cout << "\n";
 
-  std::vector<Material> materials = all_materials(max_pieces);
+  std::vector<Material> materials = all_materials(opts.max_pieces);
 
   std::size_t total_materials = 0;
   std::size_t total_positions = 0;
   std::size_t total_wdl_errors = 0;
   std::size_t total_dtm_errors = 0;
-  std::size_t skipped_materials = 0;
+  std::size_t skipped = 0;
 
   for (const Material& m : materials) {
-    // Load WDL tablebase
     std::vector<Value> wdl = load_tablebase(m);
     if (wdl.empty()) {
-      skipped_materials++;
+      skipped++;
       continue;
     }
-    wdl_cache[m] = wdl;
 
-    // Load DTM tablebase (if not wdl_only)
-    std::vector<DTM> dtm;
-    if (!wdl_only) {
-      dtm = load_dtm(m);
-      if (dtm.empty()) {
-        std::cout << "Skipping material " << m << " (DTM not found)" << std::endl;
-        skipped_materials++;
-        continue;
-      }
-      dtm_cache[m] = dtm;
+    if (!opts.wdl_only && load_dtm(m).empty()) {
+      std::cout << "Skipping " << m << " (no DTM)\n";
+      skipped++;
+      continue;
     }
 
     std::size_t size = material_size(m);
-    std::cout << "Verifying material " << m << " (" << size << " positions)..." << std::endl;
+    std::cout << "Verifying " << m << " (" << size << " positions)...";
+    std::cout.flush();
 
-    std::size_t wdl_errors = 0;
-    std::size_t dtm_errors = 0;
+    Errors errors = verify(m, !opts.wdl_only, opts.verbose);
 
-    for (std::size_t idx = 0; idx < size; ++idx) {
-      Board board = index_to_board(idx, m);
-      Value expected_wdl = wdl[idx];
-      DTM expected_dtm = wdl_only ? DTM_DRAW : dtm[idx];
-
-      if (wdl_only) {
-        // Only verify WDL consistency
-        std::vector<Move> moves;
-        generateMoves(board, moves);
-
-        Value computed_wdl;
-        if (moves.empty()) {
-          computed_wdl = Value::LOSS;
-        } else {
-          bool found_loss = false;
-          bool all_wins = true;
-          for (const Move& move : moves) {
-            Board next = makeMove(board, move);
-            Value succ_wdl = lookup_wdl(next);
-            Material next_m = get_material(next);
-            if (next_m.white_pieces() == 0) {
-              succ_wdl = Value::LOSS;
-            }
-            if (succ_wdl == Value::LOSS) found_loss = true;
-            if (succ_wdl != Value::WIN) all_wins = false;
-          }
-          if (found_loss) computed_wdl = Value::WIN;
-          else if (all_wins) computed_wdl = Value::LOSS;
-          else computed_wdl = Value::DRAW;
-        }
-
-        if (computed_wdl != expected_wdl) {
-          wdl_errors++;
-          if (verbose) {
-            std::cout << "  WDL ERROR at index " << idx << ":" << std::endl;
-            print_board(board);
-            std::cout << "    Expected: " << value_to_string(expected_wdl) << std::endl;
-            std::cout << "    Computed: " << value_to_string(computed_wdl) << std::endl;
-          }
-        }
-      } else {
-        // Full WDL + DTM verification
-        if (!verify_position(board, expected_wdl, expected_dtm, m, idx, verbose)) {
-          // Check which type of error
-          std::vector<Move> moves;
-          generateMoves(board, moves);
-
-          Value computed_wdl;
-          if (moves.empty()) {
-            computed_wdl = Value::LOSS;
-          } else {
-            bool found_loss = false;
-            bool all_wins = true;
-            for (const Move& move : moves) {
-              Board next = makeMove(board, move);
-              Value succ_wdl = lookup_wdl(next);
-              Material next_m = get_material(next);
-              if (next_m.white_pieces() == 0) succ_wdl = Value::LOSS;
-              if (succ_wdl == Value::LOSS) found_loss = true;
-              if (succ_wdl != Value::WIN) all_wins = false;
-            }
-            if (found_loss) computed_wdl = Value::WIN;
-            else if (all_wins) computed_wdl = Value::LOSS;
-            else computed_wdl = Value::DRAW;
-          }
-
-          if (computed_wdl != expected_wdl) {
-            wdl_errors++;
-          } else {
-            dtm_errors++;
-          }
-        }
-      }
+    std::cout << " WDL: " << (errors.wdl == 0 ? "OK" : std::to_string(errors.wdl) + " ERRORS");
+    if (!opts.wdl_only) {
+      std::cout << "  DTM: " << (errors.dtm == 0 ? "OK" : std::to_string(errors.dtm) + " ERRORS");
     }
-
-    // Report per-material results
-    if (wdl_errors == 0 && dtm_errors == 0) {
-      std::cout << "  WDL: OK";
-      if (!wdl_only) std::cout << "  DTM: OK";
-      std::cout << std::endl;
-    } else {
-      if (wdl_errors > 0) {
-        std::cout << "  WDL: " << wdl_errors << " ERRORS" << std::endl;
-      } else {
-        std::cout << "  WDL: OK" << std::endl;
-      }
-      if (!wdl_only) {
-        if (dtm_errors > 0) {
-          std::cout << "  DTM: " << dtm_errors << " ERRORS" << std::endl;
-        } else {
-          std::cout << "  DTM: OK" << std::endl;
-        }
-      }
-    }
+    std::cout << "\n";
 
     total_materials++;
     total_positions += size;
-    total_wdl_errors += wdl_errors;
-    total_dtm_errors += dtm_errors;
+    total_wdl_errors += errors.wdl;
+    total_dtm_errors += errors.dtm;
   }
 
-  std::cout << std::endl;
-  std::cout << "=== Verification Summary ===" << std::endl;
-  std::cout << "Materials verified: " << total_materials << std::endl;
-  std::cout << "Materials skipped: " << skipped_materials << std::endl;
-  std::cout << "Positions checked: " << total_positions << std::endl;
-  std::cout << "WDL errors: " << total_wdl_errors << std::endl;
-  if (!wdl_only) {
-    std::cout << "DTM errors: " << total_dtm_errors << std::endl;
+  std::cout << "\n=== Summary ===\n"
+            << "Materials: " << total_materials << " verified, " << skipped << " skipped\n"
+            << "Positions: " << total_positions << "\n"
+            << "WDL errors: " << total_wdl_errors << "\n";
+  if (!opts.wdl_only) {
+    std::cout << "DTM errors: " << total_dtm_errors << "\n";
   }
 
-  if (total_wdl_errors == 0 && total_dtm_errors == 0) {
-    std::cout << std::endl << "All tablebases verified successfully!" << std::endl;
-    return 0;
-  } else {
-    std::cout << std::endl << "VERIFICATION FAILED" << std::endl;
-    return 1;
-  }
+  bool success = (total_wdl_errors == 0 && total_dtm_errors == 0);
+  std::cout << "\n" << (success ? "All tablebases verified." : "VERIFICATION FAILED") << "\n";
+  return success ? 0 : 1;
 }

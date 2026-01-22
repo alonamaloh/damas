@@ -192,6 +192,26 @@ std::size_t expected_compressed_size(std::size_t num_values, CompressionMethod m
 
 #include <list>
 
+// Cache key: combines material and block index to avoid collisions across tablebases
+struct BlockCacheKey {
+  Material material;
+  std::uint32_t block_idx;
+
+  bool operator==(const BlockCacheKey& other) const {
+    return material == other.material && block_idx == other.block_idx;
+  }
+};
+
+// Hash function for BlockCacheKey
+struct BlockCacheKeyHash {
+  std::size_t operator()(const BlockCacheKey& key) const {
+    // Combine material hash with block index
+    std::size_t h = std::hash<Material>{}(key.material);
+    h ^= std::hash<std::uint32_t>{}(key.block_idx) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    return h;
+  }
+};
+
 // LRU cache for decompressed blocks.
 // Used for sequential-access compression methods that require full block decompression.
 class BlockCache {
@@ -223,8 +243,8 @@ private:
   std::size_t misses_ = 0;
 
   // LRU list: front = most recently used, back = least recently used
-  std::list<std::pair<std::uint32_t, std::vector<Value>>> lru_list_;
-  std::unordered_map<std::uint32_t, decltype(lru_list_)::iterator> cache_map_;
+  std::list<std::pair<BlockCacheKey, std::vector<Value>>> lru_list_;
+  std::unordered_map<BlockCacheKey, decltype(lru_list_)::iterator, BlockCacheKeyHash> cache_map_;
 };
 
 // ============================================================================
@@ -390,4 +410,62 @@ RunStatistics collect_all_tablebase_statistics(const std::string& directory = ".
 
 // Print statistics summary
 void print_run_statistics(const RunStatistics& stats);
+
+// ============================================================================
+// Compressed Tablebase Lookup with Search (Public API)
+// ============================================================================
+
+// A cache manager for compressed tablebases that provides a clean API for
+// looking up WDL values. Handles:
+// - Loading compressed tablebases on demand
+// - Caching loaded tablebases and decompressed blocks
+// - Searching through tense (capture) positions
+// - Looking up sub-tablebases when material changes after captures
+//
+// Usage example:
+//   CompressedTablebaseManager manager("./tablebases");
+//   Value result = manager.lookup_wdl(board);
+//
+class CompressedTablebaseManager {
+public:
+  // Construct with directory containing compressed tablebases (cwdl_*.bin)
+  // block_cache_size: number of decompressed blocks to cache (default 64)
+  explicit CompressedTablebaseManager(const std::string& directory,
+                                       std::size_t block_cache_size = 64);
+
+  // Look up the WDL value for a position.
+  // Handles tense positions by searching through forced capture sequences.
+  // Returns Value::UNKNOWN if the tablebase is not available.
+  Value lookup_wdl(const Board& board);
+
+  // Get a loaded tablebase (or nullptr if not available)
+  const CompressedTablebase* get_tablebase(const Material& m);
+
+  // Clear all caches (tablebases and blocks)
+  void clear();
+
+  // Get the directory being used
+  const std::string& directory() const { return directory_; }
+
+  // Get block cache statistics
+  const BlockCache& block_cache() const { return block_cache_; }
+
+private:
+  std::string directory_;
+  std::unordered_map<Material, CompressedTablebase> tb_cache_;
+  BlockCache block_cache_;
+
+  // Load a compressed tablebase (or return cached)
+  CompressedTablebase* load_or_get(const Material& m);
+
+  // Internal lookup with search through captures
+  Value lookup_with_search(const Board& b,
+                           std::unordered_set<std::uint64_t>& visited,
+                           int depth);
+
+  // Search through capture sequences (tense positions)
+  Value search_through_captures(const Board& b,
+                                std::unordered_set<std::uint64_t>& visited,
+                                int depth);
+};
 
