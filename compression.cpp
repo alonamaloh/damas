@@ -154,7 +154,8 @@ static inline Value score_to_value(int score) {
 // The Lookup callable returns an int score for quiet positions.
 // Template to allow different lookup strategies (uncompressed, compressed, manager).
 template<typename Lookup>
-static int negamax(const Board& b, int alpha, int beta, Lookup&& lookup) {
+static int negamax(const Board& b, int alpha, int beta, Lookup&& lookup,
+                   SearchStats* stats = nullptr) {
   // Quiet position: use the lookup function
   if (!has_captures(b)) {
     return lookup(b);
@@ -173,10 +174,11 @@ static int negamax(const Board& b, int alpha, int beta, Lookup&& lookup) {
 
     // Terminal: captured all opponent pieces
     if (next.white == 0) {
+      if (stats) stats->terminal_wins++;
       return SCORE_WIN;
     }
 
-    int score = -negamax(next, -beta, -alpha, lookup);
+    int score = -negamax(next, -beta, -alpha, lookup, stats);
 
     if (score >= beta) {
       return score;  // Beta cutoff
@@ -246,7 +248,7 @@ Value lookup_wdl_with_search(
     return value_to_score(tablebase[idx]);
   };
 
-  int score = negamax(b, SCORE_LOSS, SCORE_WIN, lookup);
+  int score = negamax(b, SCORE_LOSS, SCORE_WIN, lookup, stats);
   return score_to_value(score);
 }
 
@@ -1604,7 +1606,7 @@ std::vector<std::uint8_t> compress_rle_huffman_3val(const Value* values, std::si
 
   // Header stores actual run values:
   // - run0_val: actual value of run 0
-  // - run1_val: actual value of run 1
+  // - run1_val: actual value of run 1 (guaranteed different from run0_val since runs alternate)
   // - third_val: the third distinct value (the one that's not run0_val or run1_val)
   std::uint8_t run0_val = runs[0].value;
   std::uint8_t run1_val = runs[1].value;
@@ -1615,22 +1617,6 @@ std::vector<std::uint8_t> compress_rle_huffman_3val(const Value* values, std::si
     if (runs[i].value != run0_val && runs[i].value != run1_val) {
       third_val = runs[i].value;
       break;
-    }
-  }
-  // Handle edge case where run0_val == run1_val
-  if (run0_val == run1_val) {
-    // Find two distinct values that aren't run0_val
-    bool found_second = false;
-    for (std::size_t i = 0; i < runs.size(); ++i) {
-      if (runs[i].value != run0_val) {
-        if (!found_second) {
-          run1_val = runs[i].value;  // This becomes the "run1" value for bootstrapping
-          found_second = true;
-        } else if (runs[i].value != run1_val) {
-          third_val = runs[i].value;
-          break;
-        }
-      }
     }
   }
 

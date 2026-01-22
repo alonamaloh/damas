@@ -42,6 +42,12 @@ inline Value score_to_value(int score) {
 // The lookup function returns a score for quiet positions
 template<typename Lookup>
 int compute_wdl_negamax(const Board& b, int alpha, int beta, Lookup&& lookup) {
+  // Quiet position: use the lookup function
+  if (!has_captures(b)) {
+    return lookup(b);
+  }
+
+  // Capture position: search through forced moves
   std::vector<Move> moves;
   generateMoves(b, moves);
 
@@ -71,11 +77,6 @@ int compute_wdl_negamax(const Board& b, int alpha, int beta, Lookup&& lookup) {
 // Compute WDL using negamax
 template<typename Lookup>
 Value compute_wdl(const Board& b, Lookup&& lookup) {
-  // For quiet positions, the lookup gives us the stored value
-  // For positions with captures, we compute via negamax
-  if (!has_captures(b)) {
-    return score_to_value(lookup(b));
-  }
   int score = compute_wdl_negamax(b, SCORE_LOSS, SCORE_WIN, lookup);
   return score_to_value(score);
 }
@@ -278,12 +279,29 @@ VerifyStats verify_wdl(const Material& m, std::size_t size,
 
 struct Options {
   std::string directory = ".";
+  std::string material_str;  // Single material to verify (e.g., "000131")
   int max_pieces = 0;
   bool verbose = false;
   bool wdl_only = false;
   bool compressed = false;
   bool auto_detect = true;
 };
+
+// Parse material string like "000131" into Material struct
+Material parse_material(const std::string& s) {
+  if (s.length() != 6) {
+    std::cerr << "Invalid material format: " << s << " (expected 6 digits)\n";
+    std::exit(1);
+  }
+  Material m;
+  m.back_white_pawns = s[0] - '0';
+  m.back_black_pawns = s[1] - '0';
+  m.other_white_pawns = s[2] - '0';
+  m.other_black_pawns = s[3] - '0';
+  m.white_queens = s[4] - '0';
+  m.black_queens = s[5] - '0';
+  return m;
+}
 
 Options parse_args(int argc, char* argv[]) {
   Options opts;
@@ -300,31 +318,46 @@ Options parse_args(int argc, char* argv[]) {
     } else if (std::strcmp(argv[i], "--uncompressed") == 0) {
       opts.compressed = false;
       opts.auto_detect = false;
+    } else if (std::strncmp(argv[i], "--material=", 11) == 0) {
+      opts.material_str = argv[i] + 11;
     } else if (argv[i][0] != '-') {
       positional.push_back(argv[i]);
     }
   }
 
   if (positional.size() == 1) {
-    opts.max_pieces = std::atoi(positional[0].c_str());
+    // Could be max_pieces or material
+    if (positional[0].length() == 6 && std::isdigit(positional[0][0])) {
+      opts.material_str = positional[0];
+    } else {
+      opts.max_pieces = std::atoi(positional[0].c_str());
+    }
   } else if (positional.size() == 2) {
     opts.directory = positional[0];
-    opts.max_pieces = std::atoi(positional[1].c_str());
+    if (positional[1].length() == 6 && std::isdigit(positional[1][0])) {
+      opts.material_str = positional[1];
+    } else {
+      opts.max_pieces = std::atoi(positional[1].c_str());
+    }
   }
 
   return opts;
 }
 
 void usage(const char* prog) {
-  std::cerr << "Usage: " << prog << " [options] [directory] <max_pieces>\n\n"
+  std::cerr << "Usage: " << prog << " [options] [directory] <max_pieces|material>\n\n"
             << "Options:\n"
             << "  -v, --verbose      Show detailed error information\n"
             << "  --wdl-only         Only verify WDL (skip DTM)\n"
             << "  --compressed       Use compressed tablebases (cwdl_*.bin)\n"
-            << "  --uncompressed     Use uncompressed tablebases (wdl_*.bin)\n\n"
+            << "  --uncompressed     Use uncompressed tablebases (wdl_*.bin)\n"
+            << "  --material=XXXXXX  Verify only this material (e.g., 000131)\n\n"
             << "If neither --compressed nor --uncompressed is specified,\n"
             << "auto-detects based on which files are present.\n\n"
-            << "DTM verification is only available for uncompressed tablebases.\n";
+            << "Examples:\n"
+            << "  " << prog << " 5                    # Verify all up to 5 pieces\n"
+            << "  " << prog << " --compressed 000131  # Verify single material\n"
+            << "  " << prog << " . 000131             # Verify single material in current dir\n";
 }
 
 } // namespace
@@ -332,7 +365,11 @@ void usage(const char* prog) {
 int main(int argc, char* argv[]) {
   Options opts = parse_args(argc, argv);
 
-  if (opts.max_pieces < 2 || opts.max_pieces > 8) {
+  // Validate: need either max_pieces or material
+  bool have_material = !opts.material_str.empty();
+  bool have_max_pieces = opts.max_pieces >= 2 && opts.max_pieces <= 8;
+
+  if (!have_material && !have_max_pieces) {
     usage(argv[0]);
     return 1;
   }
@@ -350,14 +387,23 @@ int main(int argc, char* argv[]) {
 
   std::cout << "=== Tablebase Verification ===\n"
             << "Directory: " << opts.directory << "\n"
-            << "Mode: " << (opts.compressed ? "compressed" : "uncompressed") << "\n"
-            << "Verifying up to " << opts.max_pieces << " pieces\n";
+            << "Mode: " << (opts.compressed ? "compressed" : "uncompressed") << "\n";
+  if (have_material) {
+    std::cout << "Verifying material: " << opts.material_str << "\n";
+  } else {
+    std::cout << "Verifying up to " << opts.max_pieces << " pieces\n";
+  }
   if (opts.wdl_only || opts.compressed) {
     std::cout << "WDL only" << (opts.compressed ? " (DTM not available for compressed)" : "") << "\n";
   }
   std::cout << "\n";
 
-  std::vector<Material> materials = all_materials(opts.max_pieces);
+  std::vector<Material> materials;
+  if (have_material) {
+    materials.push_back(parse_material(opts.material_str));
+  } else {
+    materials = all_materials(opts.max_pieces);
+  }
 
   std::size_t total_materials = 0;
   std::size_t total_positions = 0;
@@ -388,11 +434,27 @@ int main(int argc, char* argv[]) {
         return value_to_score(lookup_compressed(*ptb, board_to_index(pos, pm)));
       };
 
-      auto get_stored = [&tb, &m](std::size_t idx) -> Value {
-        return lookup_compressed(*tb, idx);
-      };
+      // For compressed tablebases, only verify quiet positions.
+      // Don't-care positions (with captures) don't store values.
+      VerifyStats stats;
+      for (std::size_t idx = 0; idx < size; ++idx) {
+        Board board = index_to_board(idx, m);
 
-      VerifyStats stats = verify_wdl(m, size, lookup, get_stored, opts.verbose);
+        // Skip don't-care positions - they don't store values
+        if (has_captures(board)) {
+          continue;
+        }
+
+        Value stored = lookup_compressed(*tb, idx);
+        Value computed = compute_wdl(board, lookup);
+
+        if (stored != computed) {
+          stats.wdl_errors++;
+          if (opts.verbose) {
+            show_wdl_error(board, idx, stored, computed, lookup);
+          }
+        }
+      }
 
       std::cout << " WDL: " << (stats.wdl_errors == 0 ? "OK" : std::to_string(stats.wdl_errors) + " ERRORS")
                 << "\n";
