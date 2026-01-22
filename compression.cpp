@@ -862,8 +862,8 @@ CompressedTablebase compress_tablebase(
 
   CompressedTablebase tb;
   tb.material = m;
-  tb.num_positions = static_cast<std::uint32_t>(values.size());
-  tb.num_blocks = (tb.num_positions + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  tb.num_positions = values.size();
+  tb.num_blocks = static_cast<std::uint32_t>((tb.num_positions + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
   tb.block_offsets.reserve(tb.num_blocks);
 
@@ -2465,8 +2465,8 @@ bool save_compressed_tablebase(const CompressedTablebase& tb, const std::string&
   };
   file.write(reinterpret_cast<const char*>(mat), 6);
 
-  // Write num_positions (4 bytes, little-endian)
-  file.write(reinterpret_cast<const char*>(&tb.num_positions), 4);
+  // Write num_positions (8 bytes, little-endian) - v2 format
+  file.write(reinterpret_cast<const char*>(&tb.num_positions), 8);
 
   // Write num_blocks (4 bytes, little-endian)
   file.write(reinterpret_cast<const char*>(&tb.num_blocks), 4);
@@ -2514,8 +2514,8 @@ CompressedTablebase load_compressed_tablebase(const std::string& filename) {
   tb.material.white_queens = mat[4];
   tb.material.black_queens = mat[5];
 
-  // Read num_positions
-  file.read(reinterpret_cast<char*>(&tb.num_positions), 4);
+  // Read num_positions (8 bytes in v2 format)
+  file.read(reinterpret_cast<char*>(&tb.num_positions), 8);
 
   // Read num_blocks
   file.read(reinterpret_cast<char*>(&tb.num_blocks), 4);
@@ -2526,7 +2526,7 @@ CompressedTablebase load_compressed_tablebase(const std::string& filename) {
             tb.num_blocks * sizeof(std::uint32_t));
 
   // Calculate block data size and read it
-  // Block data starts after header (4+1+6+4+4 = 19 bytes) + offsets (4*num_blocks)
+  // Block data starts after header (4+1+6+8+4 = 23 bytes) + offsets (4*num_blocks)
   std::streampos current_pos = file.tellg();
   file.seekg(0, std::ios::end);
   std::streampos end_pos = file.tellg();

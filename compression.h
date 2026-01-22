@@ -145,8 +145,8 @@ struct CompressedBlock {
 // Compressed tablebase structure
 struct CompressedTablebase {
   Material material{};
-  std::uint32_t num_positions = 0;
-  std::uint32_t num_blocks = 0;
+  std::uint64_t num_positions = 0;  // 64-bit to support 10+ piece endgames
+  std::uint32_t num_blocks = 0;     // Max ~1M blocks even for 16B positions
   std::vector<std::uint32_t> block_offsets;  // Offset to each block's data
   std::vector<std::uint8_t> block_data;      // Concatenated compressed blocks
 
@@ -296,18 +296,18 @@ BlockCompressionStats analyze_block_compression(const CompressedTablebase& tb);
 // ============================================================================
 
 constexpr char CWDL_MAGIC[4] = {'C', 'W', 'D', 'L'};
-constexpr std::uint8_t CWDL_VERSION = 1;
+constexpr std::uint8_t CWDL_VERSION = 2;  // v2: 64-bit num_positions
 
 // ============================================================================
 // Compressed Tablebase File I/O (Stage 5)
 // ============================================================================
 
 // Save a compressed tablebase to a file.
-// File format:
+// File format (v2):
 //   [4 bytes]  Magic "CWDL"
-//   [1 byte]   Version
+//   [1 byte]   Version (2)
 //   [6 bytes]  Material (6 piece counts)
-//   [4 bytes]  num_positions
+//   [8 bytes]  num_positions (64-bit, little-endian)
 //   [4 bytes]  num_blocks
 //   [4 bytes × num_blocks]  Block offsets
 //   [variable] Block data (concatenated compressed blocks)
