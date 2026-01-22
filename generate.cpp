@@ -48,19 +48,6 @@ void store_wdl_tablebase(const Material& m, std::vector<Value>&& table) {
   g_wdl_tablebases[m] = std::move(table);
 }
 
-// Build local sub_tablebases from dependencies (for thread-local use)
-std::unordered_map<Material, std::vector<Value>> build_local_wdl_tablebases(
-    const std::vector<Material>& deps) {
-  std::unordered_map<Material, std::vector<Value>> local;
-  for (const Material& dep : deps) {
-    std::vector<Value> tb = get_wdl_tablebase(dep);
-    if (!tb.empty()) {
-      local[dep] = std::move(tb);
-    }
-  }
-  return local;
-}
-
 // Global DTM tablebases (thread-safe access)
 std::unordered_map<Material, std::vector<DTM>> g_dtm_tablebases;
 std::mutex g_dtm_tablebases_mutex;
@@ -74,18 +61,6 @@ std::vector<DTM> get_dtm_tablebase(const Material& m) {
 void store_dtm_tablebase(const Material& m, std::vector<DTM>&& table) {
   std::lock_guard<std::mutex> lock(g_dtm_tablebases_mutex);
   g_dtm_tablebases[m] = std::move(table);
-}
-
-std::unordered_map<Material, std::vector<DTM>> build_local_dtm_tablebases(
-    const std::vector<Material>& deps) {
-  std::unordered_map<Material, std::vector<DTM>> local;
-  for (const Material& dep : deps) {
-    std::vector<DTM> tb = get_dtm_tablebase(dep);
-    if (!tb.empty()) {
-      local[dep] = std::move(tb);
-    }
-  }
-  return local;
 }
 
 // Forward declarations for parallel solver
@@ -382,6 +357,284 @@ std::vector<Value> generate_tablebase(
   }
 
   return table;
+}
+
+// ============================================================================
+// Position-Level Parallel DTM Generation
+// ============================================================================
+
+// Compute DTM value for a single position given current table states
+// Returns DTM_UNKNOWN if not yet determinable
+DTM compute_dtm_value(
+    std::size_t idx,
+    const Material& m,
+    Value wdl_val,
+    const std::vector<DTM>& dtm_m,
+    const std::vector<DTM>& dtm_fm,
+    const std::unordered_map<Material, std::vector<DTM>>& dtm_deps) {
+
+  // DRAW positions are always DTM_DRAW
+  if (wdl_val == Value::DRAW) return DTM_DRAW;
+
+  Board board = index_to_board(idx, m);
+  std::vector<Move> moves;
+  generateMoves(board, moves);
+
+  // Terminal LOSS (no moves)
+  if (moves.empty()) return DTM_LOSS_TERMINAL;
+
+  Material fm = flip(m);
+  bool symmetric = (m == fm);
+
+  if (wdl_val == Value::WIN) {
+    // Find opponent's quickest LOSS (highest negative DTM = fewest moves)
+    // Process all successors, take the best among those with known DTM
+    DTM best = DTM_UNKNOWN;
+
+    for (const Move& move : moves) {
+      Board next = makeMove(board, move);
+      Material next_m = get_material(next);
+      DTM succ_dtm = DTM_UNKNOWN;
+
+      // Terminal capture
+      if (next_m.white_pieces() == 0) {
+        succ_dtm = DTM_LOSS_TERMINAL;
+      } else if (next_m.black_pieces() == 0) {
+        continue;  // Shouldn't happen for WIN position
+      } else if (next_m == fm) {
+        // Same material after flip
+        std::size_t next_idx = board_to_index(next, fm);
+        if (symmetric) {
+          succ_dtm = dtm_m[next_idx];
+        } else {
+          succ_dtm = dtm_fm[next_idx];
+        }
+      } else {
+        // Different material (capture/promotion)
+        auto it = dtm_deps.find(next_m);
+        if (it != dtm_deps.end()) {
+          std::size_t next_idx = board_to_index(next, next_m);
+          if (next_idx < it->second.size()) {
+            succ_dtm = it->second[next_idx];
+          }
+        }
+      }
+
+      // Only consider LOSS successors (negative DTM, excluding UNKNOWN)
+      if (succ_dtm < DTM_DRAW && succ_dtm != DTM_UNKNOWN) {
+        // Track quickest loss for opponent (highest negative = fastest win for us)
+        if (best == DTM_UNKNOWN) {
+          best = succ_dtm;
+        } else if (succ_dtm == DTM_LOSS_TERMINAL) {
+          best = DTM_LOSS_TERMINAL;
+        } else if (best != DTM_LOSS_TERMINAL && succ_dtm > best) {
+          best = succ_dtm;
+        }
+      }
+    }
+
+    if (best != DTM_UNKNOWN) {
+      int opp_moves = (best == DTM_LOSS_TERMINAL) ? 0 : -best;
+      return dtm_win(opp_moves + 1);
+    }
+    return DTM_UNKNOWN;
+  }
+
+  // LOSS: find opponent's slowest WIN (highest positive DTM)
+  DTM worst = DTM_UNKNOWN;
+  bool all_known = true;
+
+  for (const Move& move : moves) {
+    Board next = makeMove(board, move);
+    Material next_m = get_material(next);
+    DTM succ_dtm = DTM_UNKNOWN;
+
+    if (next_m.white_pieces() == 0) {
+      succ_dtm = DTM_LOSS_TERMINAL;  // Terminal loss for opponent
+    } else if (next_m.black_pieces() == 0) {
+      succ_dtm = dtm_win(1);  // We captured everything
+    } else if (next_m == fm) {
+      std::size_t next_idx = board_to_index(next, fm);
+      if (symmetric) {
+        succ_dtm = dtm_m[next_idx];
+      } else {
+        succ_dtm = dtm_fm[next_idx];
+      }
+    } else {
+      auto it = dtm_deps.find(next_m);
+      if (it != dtm_deps.end()) {
+        std::size_t next_idx = board_to_index(next, next_m);
+        if (next_idx < it->second.size()) {
+          succ_dtm = it->second[next_idx];
+        }
+      }
+    }
+
+    if (succ_dtm == DTM_UNKNOWN) {
+      all_known = false;
+      break;
+    }
+
+    // Track slowest win for opponent (we want to survive longest)
+    if (succ_dtm > DTM_DRAW) {
+      if (worst == DTM_UNKNOWN || succ_dtm > worst) {
+        worst = succ_dtm;
+      }
+    }
+  }
+
+  if (all_known && worst != DTM_UNKNOWN) {
+    return dtm_loss(worst);
+  }
+  return DTM_UNKNOWN;
+}
+
+// Generate DTM tablebase(s) for material M (and flip(M) if different)
+// Uses position-level parallelism with level-synchronized iteration
+void generate_dtm_parallel(
+    const Material& m,
+    const std::unordered_map<Material, std::vector<Value>>& wdl_deps,
+    const std::unordered_map<Material, std::vector<DTM>>& dtm_deps) {
+
+  Material fm = flip(m);
+  bool symmetric = (m == fm);
+
+  std::size_t size_m = material_size(m);
+  std::size_t size_fm = symmetric ? 0 : material_size(fm);
+
+  // Load WDL tables
+  auto wdl_m_it = wdl_deps.find(m);
+  auto wdl_fm_it = wdl_deps.find(fm);
+  if (wdl_m_it == wdl_deps.end() || wdl_m_it->second.empty()) {
+    std::cerr << "Error: WDL not found for " << m << std::endl;
+    return;
+  }
+  const std::vector<Value>& wdl_m = wdl_m_it->second;
+  const std::vector<Value>& wdl_fm = symmetric ? wdl_m :
+    (wdl_fm_it != wdl_deps.end() ? wdl_fm_it->second : wdl_m);
+
+  std::vector<DTM> dtm_m(size_m, DTM_UNKNOWN);
+  std::vector<DTM> dtm_fm(size_fm, DTM_UNKNOWN);
+
+  auto start = std::chrono::high_resolution_clock::now();
+
+  // Initialize: DRAW = 0, terminal LOSS = -128
+  #pragma omp parallel for schedule(dynamic, 1024)
+  for (std::size_t idx = 0; idx < size_m; ++idx) {
+    if (wdl_m[idx] == Value::DRAW) {
+      dtm_m[idx] = DTM_DRAW;
+    } else if (wdl_m[idx] == Value::LOSS) {
+      Board board = index_to_board(idx, m);
+      std::vector<Move> moves;
+      generateMoves(board, moves);
+      if (moves.empty()) dtm_m[idx] = DTM_LOSS_TERMINAL;
+    }
+  }
+
+  if (!symmetric) {
+    #pragma omp parallel for schedule(dynamic, 1024)
+    for (std::size_t idx = 0; idx < size_fm; ++idx) {
+      if (wdl_fm[idx] == Value::DRAW) {
+        dtm_fm[idx] = DTM_DRAW;
+      } else if (wdl_fm[idx] == Value::LOSS) {
+        Board board = index_to_board(idx, fm);
+        std::vector<Move> moves;
+        generateMoves(board, moves);
+        if (moves.empty()) dtm_fm[idx] = DTM_LOSS_TERMINAL;
+      }
+    }
+  }
+
+  // Iterate until stable
+  int iteration = 0;
+  bool changed = true;
+  constexpr int MAX_ITERATIONS = 200;
+
+  while (changed && iteration < MAX_ITERATIONS) {
+    changed = false;
+    iteration++;
+
+    // Update dtm_m in parallel
+    #pragma omp parallel for schedule(dynamic, 1024) reduction(||:changed)
+    for (std::size_t idx = 0; idx < size_m; ++idx) {
+      if (wdl_m[idx] == Value::DRAW) continue;
+
+      DTM new_val = compute_dtm_value(idx, m, wdl_m[idx], dtm_m, dtm_fm, dtm_deps);
+      if (new_val != DTM_UNKNOWN && dtm_m[idx] != new_val) {
+        // For WIN: update if better (smaller = faster win)
+        // For LOSS: update if different (as successor WINs stabilize)
+        if (wdl_m[idx] == Value::WIN) {
+          if (dtm_m[idx] == DTM_UNKNOWN || new_val < dtm_m[idx]) {
+            dtm_m[idx] = new_val;
+            changed = true;
+          }
+        } else {
+          // LOSS: always update when different (value improves as WINs stabilize)
+          dtm_m[idx] = new_val;
+          changed = true;
+        }
+      }
+    }
+
+    if (!symmetric) {
+      // Update dtm_fm in parallel
+      #pragma omp parallel for schedule(dynamic, 1024) reduction(||:changed)
+      for (std::size_t idx = 0; idx < size_fm; ++idx) {
+        if (wdl_fm[idx] == Value::DRAW) continue;
+
+        DTM new_val = compute_dtm_value(idx, fm, wdl_fm[idx], dtm_fm, dtm_m, dtm_deps);
+        if (new_val != DTM_UNKNOWN && dtm_fm[idx] != new_val) {
+          if (wdl_fm[idx] == Value::WIN) {
+            if (dtm_fm[idx] == DTM_UNKNOWN || new_val < dtm_fm[idx]) {
+              dtm_fm[idx] = new_val;
+              changed = true;
+            }
+          } else {
+            dtm_fm[idx] = new_val;
+            changed = true;
+          }
+        }
+      }
+    }
+  }
+
+  if (iteration >= MAX_ITERATIONS) {
+    std::cerr << "WARNING: DTM hit max iterations for " << m << std::endl;
+  }
+
+  auto end = std::chrono::high_resolution_clock::now();
+  auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+
+  // Statistics helper
+  auto count_stats = [](const std::vector<DTM>& dtm) {
+    int max_win = 0, max_loss = 0;
+    std::size_t w = 0, l = 0, d = 0;
+    for (DTM v : dtm) {
+      if (v == DTM_DRAW) d++;
+      else if (v > 0) { w++; int p = dtm_to_plies(v); if (p > max_win) max_win = p; }
+      else if (v != DTM_UNKNOWN) { l++; int p = dtm_to_plies(v); if (p > max_loss) max_loss = p; }
+    }
+    return std::make_tuple(w, l, d, max_win, max_loss);
+  };
+
+  auto [w_m, l_m, d_m, mw_m, ml_m] = count_stats(dtm_m);
+  std::cout << "DTM " << m << " (" << size_m << " pos): "
+            << w_m << "W/" << l_m << "L/" << d_m << "D"
+            << " (max " << mw_m << "/" << ml_m << " plies), "
+            << iteration << " iters, " << duration.count() << "ms" << std::endl;
+
+  save_dtm(dtm_m, m);
+  store_dtm_tablebase(m, std::move(dtm_m));
+
+  if (!symmetric) {
+    auto [w_fm, l_fm, d_fm, mw_fm, ml_fm] = count_stats(dtm_fm);
+    std::cout << "DTM " << fm << " (" << size_fm << " pos): "
+              << w_fm << "W/" << l_fm << "L/" << d_fm << "D"
+              << " (max " << mw_fm << "/" << ml_fm << " plies)" << std::endl;
+
+    save_dtm(dtm_fm, fm);
+    store_dtm_tablebase(fm, std::move(dtm_fm));
+  }
 }
 
 // Get direct dependencies for scheduling (not transitive closure)
@@ -749,210 +1002,14 @@ void solve_all_parallel(int max_pieces, bool load_existing = false) {
   std::cout << "\nTotal generation time: " << total_duration.count() << "s" << std::endl;
 }
 
-// Thread-safe DTM solve for a single (self-symmetric) material
-void solve_dtm_single_threadsafe(const Material& m) {
-  // Build local copies of dependencies
-  std::vector<Material> deps = get_sub_materials(m);
-  std::unordered_map<Material, std::vector<Value>> local_wdl = build_local_wdl_tablebases(deps);
-  std::unordered_map<Material, std::vector<DTM>> local_dtm = build_local_dtm_tablebases(deps);
-
-  // Also load from disk if not in memory
-  for (const Material& dep : deps) {
-    if (local_wdl.find(dep) == local_wdl.end()) {
-      std::vector<Value> tb = load_tablebase(dep);
-      if (!tb.empty()) local_wdl[dep] = std::move(tb);
-    }
-    if (local_dtm.find(dep) == local_dtm.end()) {
-      std::vector<DTM> tb = load_dtm(dep);
-      if (!tb.empty()) local_dtm[dep] = std::move(tb);
-    }
-  }
-
-  // Fail loudly if any WDL dependency is missing
-  verify_dependencies(m, deps, local_wdl);
-
-  // Load WDL for this material
-  std::vector<Value> wdl = get_wdl_tablebase(m);
-  if (wdl.empty()) {
-    wdl = load_tablebase(m);
-    if (wdl.empty()) {
-      #pragma omp critical
-      std::cerr << "Error: WDL not found for " << m << std::endl;
-      return;
-    }
-  }
-  local_wdl[m] = wdl;
-
-  auto start = std::chrono::high_resolution_clock::now();
-
-  std::vector<DTM> dtm = generate_dtm(m, local_wdl, local_dtm);
-
-  auto end = std::chrono::high_resolution_clock::now();
-  auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-
-  // Statistics
-  int max_win_plies = 0, max_loss_plies = 0;
-  std::size_t wins = 0, losses = 0, draws = 0;
-  for (DTM d : dtm) {
-    if (d == DTM_DRAW) draws++;
-    else if (d > 0) {
-      wins++;
-      int plies = dtm_to_plies(d);
-      if (plies > max_win_plies) max_win_plies = plies;
-    } else if (d != DTM_UNKNOWN) {
-      losses++;
-      int plies = dtm_to_plies(d);
-      if (plies > max_loss_plies) max_loss_plies = plies;
-    }
-  }
-
-  #pragma omp critical
-  {
-    std::cout << "[Thread " << omp_get_thread_num() << "] DTM " << m
-              << ": " << wins << "W/" << losses << "L/" << draws << "D"
-              << " (max " << max_win_plies << "/" << max_loss_plies << " plies) in "
-              << duration.count() << "ms" << std::endl;
-  }
-
-  save_dtm(dtm, m);
-  store_dtm_tablebase(m, std::move(dtm));
-}
-
-// Thread-safe DTM solve for a pair of mutually-dependent materials
-void solve_dtm_pair_threadsafe(const Material& m1, const Material& m2) {
-  // Build local copies of dependencies
-  std::vector<Material> deps = get_sub_materials(m1);
-  std::unordered_map<Material, std::vector<Value>> local_wdl = build_local_wdl_tablebases(deps);
-  std::unordered_map<Material, std::vector<DTM>> local_dtm = build_local_dtm_tablebases(deps);
-
-  // Also load from disk if not in memory
-  for (const Material& dep : deps) {
-    if (local_wdl.find(dep) == local_wdl.end()) {
-      std::vector<Value> tb = load_tablebase(dep);
-      if (!tb.empty()) local_wdl[dep] = std::move(tb);
-    }
-    if (local_dtm.find(dep) == local_dtm.end()) {
-      std::vector<DTM> tb = load_dtm(dep);
-      if (!tb.empty()) local_dtm[dep] = std::move(tb);
-    }
-  }
-
-  // Fail loudly if any WDL dependency is missing
-  verify_dependencies(m1, deps, local_wdl);
-
-  // Load WDL for both materials
-  std::vector<Value> wdl1 = get_wdl_tablebase(m1);
-  if (wdl1.empty()) wdl1 = load_tablebase(m1);
-  std::vector<Value> wdl2 = get_wdl_tablebase(m2);
-  if (wdl2.empty()) wdl2 = load_tablebase(m2);
-
-  if (wdl1.empty() || wdl2.empty()) {
-    #pragma omp critical
-    std::cerr << "Error: WDL not found for " << m1 << " or " << m2 << std::endl;
-    return;
-  }
-  local_wdl[m1] = wdl1;
-  local_wdl[m2] = wdl2;
-
-  std::size_t size1 = material_size(m1);
-  std::size_t size2 = material_size(m2);
-
-  // Initialize with UNKNOWN
-  std::vector<DTM> dtm1(size1, DTM_UNKNOWN);
-  std::vector<DTM> dtm2(size2, DTM_UNKNOWN);
-
-  // Set draws and terminal losses
-  std::vector<Move> moves;
-  for (std::size_t idx = 0; idx < size1; ++idx) {
-    if (wdl1[idx] == Value::DRAW) {
-      dtm1[idx] = DTM_DRAW;
-    } else if (wdl1[idx] == Value::LOSS) {
-      Board board = index_to_board(idx, m1);
-      generateMoves(board, moves);
-      if (moves.empty()) dtm1[idx] = DTM_LOSS_TERMINAL;
-    }
-  }
-  for (std::size_t idx = 0; idx < size2; ++idx) {
-    if (wdl2[idx] == Value::DRAW) {
-      dtm2[idx] = DTM_DRAW;
-    } else if (wdl2[idx] == Value::LOSS) {
-      Board board = index_to_board(idx, m2);
-      generateMoves(board, moves);
-      if (moves.empty()) dtm2[idx] = DTM_LOSS_TERMINAL;
-    }
-  }
-
-  local_dtm[m1] = dtm1;
-  local_dtm[m2] = dtm2;
-
-  auto start = std::chrono::high_resolution_clock::now();
-
-  // Iterate until stable
-  bool changed = true;
-  int iteration = 0;
-  while (changed && iteration < 200) {
-    changed = false;
-    iteration++;
-
-    std::vector<DTM> new_dtm1 = generate_dtm(m1, local_wdl, local_dtm);
-    for (std::size_t i = 0; i < size1; ++i) {
-      if (dtm1[i] != new_dtm1[i]) {
-        changed = true;
-        dtm1[i] = new_dtm1[i];
-      }
-    }
-    local_dtm[m1] = dtm1;
-
-    std::vector<DTM> new_dtm2 = generate_dtm(m2, local_wdl, local_dtm);
-    for (std::size_t i = 0; i < size2; ++i) {
-      if (dtm2[i] != new_dtm2[i]) {
-        changed = true;
-        dtm2[i] = new_dtm2[i];
-      }
-    }
-    local_dtm[m2] = dtm2;
-  }
-
-  auto end = std::chrono::high_resolution_clock::now();
-  auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-
-  // Statistics helper
-  auto count_stats = [](const std::vector<DTM>& dtm) {
-    int max_win = 0, max_loss = 0;
-    std::size_t w = 0, l = 0, d = 0;
-    for (DTM v : dtm) {
-      if (v == DTM_DRAW) d++;
-      else if (v > 0) { w++; int p = dtm_to_plies(v); if (p > max_win) max_win = p; }
-      else if (v != DTM_UNKNOWN) { l++; int p = dtm_to_plies(v); if (p > max_loss) max_loss = p; }
-    }
-    return std::make_tuple(w, l, d, max_win, max_loss);
-  };
-
-  auto [w1, l1, d1, mw1, ml1] = count_stats(dtm1);
-  auto [w2, l2, d2, mw2, ml2] = count_stats(dtm2);
-
-  #pragma omp critical
-  {
-    std::cout << "[Thread " << omp_get_thread_num() << "] DTM pair " << m1 << " <-> " << m2
-              << " (" << iteration << " iters, " << duration.count() << "ms):" << std::endl;
-    std::cout << "    " << m1 << ": " << w1 << "W/" << l1 << "L/" << d1 << "D"
-              << " (max " << mw1 << "/" << ml1 << " plies)" << std::endl;
-    std::cout << "    " << m2 << ": " << w2 << "W/" << l2 << "L/" << d2 << "D"
-              << " (max " << mw2 << "/" << ml2 << " plies)" << std::endl;
-  }
-
-  save_dtm(dtm1, m1);
-  save_dtm(dtm2, m2);
-  store_dtm_tablebase(m1, std::move(dtm1));
-  store_dtm_tablebase(m2, std::move(dtm2));
-}
-
-// Solve all DTM tablebases in parallel using dependency graph
+// Solve all DTM tablebases using position-level parallelism
+// Materials are processed sequentially in dependency order, but each material
+// uses all available cores for parallel position processing.
 void solve_all_dtm_parallel(int max_pieces, bool load_existing = false) {
   std::vector<Material> all = all_materials(max_pieces);
 
   std::cout << "=== Parallel DTM Tablebase Generation ===" << std::endl;
-  std::cout << "Using " << omp_get_max_threads() << " threads" << std::endl;
+  std::cout << "Using " << omp_get_max_threads() << " threads (position-level parallelism)" << std::endl;
   if (load_existing) {
     std::cout << "Mode: Load existing tablebases from disk when available" << std::endl;
   }
@@ -982,144 +1039,114 @@ void solve_all_dtm_parallel(int max_pieces, bool load_existing = false) {
   }
 
   std::vector<Material> work_units(canonical_set.begin(), canonical_set.end());
-  std::cout << "Work units (canonical materials): " << work_units.size() << std::endl << std::endl;
+  std::cout << "Work units (canonical materials): " << work_units.size() << std::endl;
 
   // Build dependency graph
-  std::unordered_map<Material, std::vector<Material>> dependents;
+  std::unordered_map<Material, std::unordered_set<Material>> deps_map;
   std::unordered_map<Material, int> dep_count;
-
-  for (const Material& m : work_units) {
-    dep_count[m] = 0;
-  }
 
   for (const Material& m : work_units) {
     std::vector<Material> deps = get_dependencies(m);
     std::unordered_set<Material> canonical_deps;
-
     for (const Material& dep : deps) {
       Material c = canonical[dep];
-      if (c != m && canonical_set.find(c) != canonical_set.end()) {
+      if (!(c == m) && canonical_set.find(c) != canonical_set.end()) {
         canonical_deps.insert(c);
       }
     }
-
+    deps_map[m] = canonical_deps;
     dep_count[m] = canonical_deps.size();
-    for (const Material& dep : canonical_deps) {
-      dependents[dep].push_back(m);
-    }
   }
 
-  // Initialize ready queue
-  std::queue<Material> ready_queue;
-  std::mutex queue_mutex;
-  std::condition_variable queue_cv;
-  int remaining = work_units.size();
-  bool done = false;
+  // Topological sort using Kahn's algorithm
+  std::vector<Material> sorted;
+  std::queue<Material> ready;
 
   for (const Material& m : work_units) {
-    // Handle terminal materials
-    if (m.white_pieces() == 0 || m.black_pieces() == 0) {
-      std::size_t size = material_size(m);
-      if (size > 0) {
-        std::vector<DTM> dtm(size, DTM_DRAW);  // Terminal = game over
-        store_dtm_tablebase(m, std::move(dtm));
-      }
-      Material f = flip(m);
-      if (!(f == m)) {
-        std::size_t fsize = material_size(f);
-        if (fsize > 0) {
-          std::vector<DTM> dtm(fsize, DTM_DRAW);
-          store_dtm_tablebase(f, std::move(dtm));
-        }
-      }
-      {
-        std::lock_guard<std::mutex> lock(queue_mutex);
-        remaining--;
-        for (const Material& dep_m : dependents[m]) {
-          dep_count[dep_m]--;
-          if (dep_count[dep_m] == 0) {
-            ready_queue.push(dep_m);
-          }
-        }
-      }
-    } else if (dep_count[m] == 0) {
-      ready_queue.push(m);
+    if (dep_count[m] == 0) {
+      ready.push(m);
     }
   }
+
+  while (!ready.empty()) {
+    Material m = ready.front();
+    ready.pop();
+    sorted.push_back(m);
+
+    for (const Material& other : work_units) {
+      if (deps_map[other].count(m)) {
+        dep_count[other]--;
+        if (dep_count[other] == 0) {
+          ready.push(other);
+        }
+      }
+    }
+  }
+
+  if (sorted.size() != work_units.size()) {
+    std::cerr << "ERROR: Dependency cycle detected in DTM generation!" << std::endl;
+    return;
+  }
+
+  std::cout << std::endl;
 
   auto total_start = std::chrono::high_resolution_clock::now();
 
-  // Worker function
-  auto worker = [&]() {
-    while (true) {
-      Material m;
-      {
-        std::unique_lock<std::mutex> lock(queue_mutex);
-        queue_cv.wait(lock, [&]() { return !ready_queue.empty() || done; });
-        if (done && ready_queue.empty()) return;
-        if (ready_queue.empty()) continue;
-        m = ready_queue.front();
-        ready_queue.pop();
-      }
+  // Process materials in dependency order
+  for (const Material& m : sorted) {
+    Material f = flip(m);
 
-      Material f = flip(m);
-      bool loaded_from_disk = false;
-
-      if (load_existing) {
-        std::vector<DTM> tb_m = load_dtm(m);
-        if (!tb_m.empty()) {
-          store_dtm_tablebase(m, std::move(tb_m));
-          if (!(f == m)) {
-            std::vector<DTM> tb_f = load_dtm(f);
-            if (!tb_f.empty()) {
-              store_dtm_tablebase(f, std::move(tb_f));
-              loaded_from_disk = true;
-              #pragma omp critical
-              std::cout << "[Thread " << omp_get_thread_num() << "] Loaded DTM " << m << " <-> " << f << " from disk" << std::endl;
-            }
-          } else {
-            loaded_from_disk = true;
-            #pragma omp critical
-            std::cout << "[Thread " << omp_get_thread_num() << "] Loaded DTM " << m << " from disk" << std::endl;
+    // Try to load from disk if requested
+    if (load_existing) {
+      std::vector<DTM> tb_m = load_dtm(m);
+      if (!tb_m.empty()) {
+        store_dtm_tablebase(m, std::move(tb_m));
+        if (!(f == m)) {
+          std::vector<DTM> tb_f = load_dtm(f);
+          if (!tb_f.empty()) {
+            store_dtm_tablebase(f, std::move(tb_f));
           }
         }
-      }
-
-      if (!loaded_from_disk) {
-        if (m == f) {
-          solve_dtm_single_threadsafe(m);
-        } else {
-          solve_dtm_pair_threadsafe(m, f);
-        }
-      }
-
-      // Update dependents
-      {
-        std::lock_guard<std::mutex> lock(queue_mutex);
-        remaining--;
-        for (const Material& dep_m : dependents[m]) {
-          dep_count[dep_m]--;
-          if (dep_count[dep_m] == 0) {
-            ready_queue.push(dep_m);
-          }
-        }
-        if (remaining == 0) {
-          done = true;
-        }
-        queue_cv.notify_all();
+        std::cout << "Loaded DTM " << m;
+        if (!(f == m)) std::cout << " <-> " << f;
+        std::cout << " from disk" << std::endl;
+        continue;
       }
     }
-  };
 
-  // Launch worker threads
-  int num_threads = omp_get_max_threads();
-  std::vector<std::thread> threads;
-  for (int i = 0; i < num_threads; ++i) {
-    threads.emplace_back(worker);
-  }
+    // Build dependency tablebases for this material
+    std::vector<Material> deps = get_sub_materials(m);
+    std::unordered_map<Material, std::vector<Value>> wdl_tables;
+    std::unordered_map<Material, std::vector<DTM>> dtm_tables;
 
-  for (auto& t : threads) {
-    t.join();
+    for (const Material& dep : deps) {
+      // Skip terminal materials
+      if (dep.white_pieces() == 0 || dep.black_pieces() == 0) continue;
+
+      // Load WDL
+      std::vector<Value> wdl = get_wdl_tablebase(dep);
+      if (wdl.empty()) wdl = load_tablebase(dep);
+      if (!wdl.empty()) wdl_tables[dep] = std::move(wdl);
+
+      // Load DTM
+      std::vector<DTM> dtm = get_dtm_tablebase(dep);
+      if (dtm.empty()) dtm = load_dtm(dep);
+      if (!dtm.empty()) dtm_tables[dep] = std::move(dtm);
+    }
+
+    // Also load WDL for this material and its flip
+    std::vector<Value> wdl_m = get_wdl_tablebase(m);
+    if (wdl_m.empty()) wdl_m = load_tablebase(m);
+    if (!wdl_m.empty()) wdl_tables[m] = std::move(wdl_m);
+
+    if (!(f == m)) {
+      std::vector<Value> wdl_f = get_wdl_tablebase(f);
+      if (wdl_f.empty()) wdl_f = load_tablebase(f);
+      if (!wdl_f.empty()) wdl_tables[f] = std::move(wdl_f);
+    }
+
+    // Generate using position-level parallelism
+    generate_dtm_parallel(m, wdl_tables, dtm_tables);
   }
 
   auto total_end = std::chrono::high_resolution_clock::now();
