@@ -4,6 +4,7 @@
 #include "compression.h"
 #include <iostream>
 #include <iomanip>
+#include <sstream>
 #include <vector>
 #include <queue>
 #include <unordered_set>
@@ -29,6 +30,315 @@ struct Stats {
   std::size_t draws = 0;
   std::size_t with_captures = 0;  // Positions where captures are forced
 };
+
+// ============================================================================
+// Verification Functions - Stop at first error with debug info
+// ============================================================================
+
+// Print detailed position info for debugging
+[[maybe_unused]]
+void print_position_debug(const Board& board, std::size_t idx, const Material& m,
+                          Value stored, Value computed) {
+  std::cerr << "\n=== VERIFICATION ERROR ===\n";
+  std::cerr << "Material: " << m << "\n";
+  std::cerr << "Index: " << idx << "\n";
+  std::cerr << "Stored: " << static_cast<int>(stored)
+            << " (" << (stored == Value::WIN ? "WIN" :
+                       stored == Value::LOSS ? "LOSS" :
+                       stored == Value::DRAW ? "DRAW" : "UNKNOWN") << ")\n";
+  std::cerr << "Computed: " << static_cast<int>(computed)
+            << " (" << (computed == Value::WIN ? "WIN" :
+                       computed == Value::LOSS ? "LOSS" :
+                       computed == Value::DRAW ? "DRAW" : "UNKNOWN") << ")\n";
+  std::cerr << "has_captures: " << has_captures(board) << "\n";
+  std::cerr << "Board:\n" << board << "\n";
+
+  // Show successors
+  std::vector<Move> moves;
+  generateMoves(board, moves);
+  std::cerr << "Moves (" << moves.size() << "):\n";
+  for (size_t i = 0; i < moves.size(); i++) {
+    Board next = makeMove(board, moves[i]);
+    Material nm = get_material(next);
+    std::cerr << "  " << i << ": captures=0x" << std::hex << moves[i].captures
+              << std::dec << " -> " << nm << "\n";
+  }
+}
+
+// Verify a generated tablebase against its successors
+// Returns true if verification passes
+bool verify_generated_tablebase(
+    const std::vector<Value>& table,
+    const Material& m,
+    const std::vector<Value>& table_fm,  // flip(m)'s table (empty if symmetric)
+    CompressedTablebaseManager* manager) {
+
+  std::size_t size = table.size();
+  Material fm = flip(m);
+  bool symmetric = (m == fm);
+
+  std::atomic<bool> error_found{false};
+  std::atomic<std::size_t> error_idx{0};
+
+  #pragma omp parallel for schedule(dynamic, 1024)
+  for (std::size_t idx = 0; idx < size; ++idx) {
+    if (error_found.load(std::memory_order_relaxed)) continue;
+
+    Board board = index_to_board(idx, m);
+    Value stored = table[idx];
+
+    // Compute expected value
+    std::vector<Move> moves;
+    generateMoves(board, moves);
+
+    if (moves.empty()) {
+      if (stored != Value::LOSS) {
+        bool expected = false;
+        if (error_found.compare_exchange_strong(expected, true)) {
+          error_idx.store(idx);
+        }
+      }
+      continue;
+    }
+
+    bool found_loss = false;
+    bool all_wins = true;
+
+    for (const Move& move : moves) {
+      Board next = makeMove(board, move);
+      Material next_m = get_material(next);
+
+      Value succ_val = Value::UNKNOWN;
+
+      if (next_m.white_pieces() == 0) {
+        succ_val = Value::LOSS;
+      } else if (next_m.black_pieces() == 0) {
+        succ_val = Value::WIN;
+      } else if (next_m == fm) {
+        std::size_t next_idx = board_to_index(next, fm);
+        succ_val = symmetric ? table[next_idx] : table_fm[next_idx];
+      } else {
+        succ_val = manager->lookup_wdl(next);
+      }
+
+      if (succ_val == Value::LOSS) found_loss = true;
+      if (succ_val != Value::WIN) all_wins = false;
+    }
+
+    Value expected;
+    if (found_loss) expected = Value::WIN;
+    else if (all_wins) expected = Value::LOSS;
+    else expected = Value::DRAW;
+
+    if (stored != expected) {
+      bool was_false = false;
+      if (error_found.compare_exchange_strong(was_false, true)) {
+        error_idx.store(idx);
+      }
+    }
+  }
+
+  if (error_found.load()) {
+    std::size_t idx = error_idx.load();
+    Board board = index_to_board(idx, m);
+    Value stored = table[idx];
+
+    // Recompute for debug output
+    std::vector<Move> moves;
+    generateMoves(board, moves);
+
+    bool found_loss = false;
+    bool all_wins = true;
+    bool has_draw = false;
+
+    std::cerr << "\n=== GENERATION VERIFICATION ERROR ===\n";
+    std::cerr << "Material: " << m << "\n";
+    std::cerr << "Index: " << idx << "\n";
+    std::cerr << "Stored: " << static_cast<int>(stored) << "\n";
+    std::cerr << "has_captures: " << has_captures(board) << "\n";
+    std::cerr << "Board:\n" << board << "\n";
+    std::cerr << "Successors:\n";
+
+    for (const Move& move : moves) {
+      Board next = makeMove(board, move);
+      Material next_m = get_material(next);
+
+      Value succ_val = Value::UNKNOWN;
+      std::string source;
+
+      if (next_m.white_pieces() == 0) {
+        succ_val = Value::LOSS;
+        source = "terminal";
+      } else if (next_m.black_pieces() == 0) {
+        succ_val = Value::WIN;
+        source = "terminal";
+      } else if (next_m == fm) {
+        std::size_t next_idx = board_to_index(next, fm);
+        succ_val = symmetric ? table[next_idx] : table_fm[next_idx];
+        source = "table_fm[" + std::to_string(next_idx) + "]";
+      } else {
+        succ_val = manager->lookup_wdl(next);
+        std::ostringstream oss;
+        oss << "manager(" << next_m << ")";
+        source = oss.str();
+      }
+
+      std::cerr << "  -> " << next_m << " val=" << static_cast<int>(succ_val)
+                << " (" << source << ")\n";
+
+      if (succ_val == Value::LOSS) found_loss = true;
+      if (succ_val != Value::WIN) all_wins = false;
+      if (succ_val == Value::DRAW) has_draw = true;
+    }
+
+    Value expected;
+    if (found_loss) expected = Value::WIN;
+    else if (all_wins) expected = Value::LOSS;
+    else expected = Value::DRAW;
+
+    std::cerr << "Expected: " << static_cast<int>(expected) << "\n";
+    std::cerr << "found_loss=" << found_loss << " all_wins=" << all_wins
+              << " has_draw=" << has_draw << "\n";
+
+    return false;
+  }
+
+  return true;
+}
+
+// Verify compression roundtrip for all methods
+bool verify_compression_roundtrip(
+    const std::vector<Value>& original,
+    const Material& m) {
+
+  std::size_t size = original.size();
+
+  // Mark don't-care positions
+  CompressionStats cstats;
+  std::vector<Value> marked = mark_dont_care_positions(original, m, cstats);
+
+  // Test block by block (compression methods are designed for BLOCK_SIZE chunks)
+  for (std::size_t block_start = 0; block_start < size; block_start += BLOCK_SIZE) {
+    std::size_t block_end = std::min(block_start + BLOCK_SIZE, size);
+    std::size_t block_size = block_end - block_start;
+
+    // Count distinct values in this block to determine which methods are valid
+    bool seen[4] = {false, false, false, false};
+    int num_distinct = 0;
+    for (std::size_t i = 0; i < block_size && num_distinct <= 3; ++i) {
+      std::uint8_t v = static_cast<std::uint8_t>(marked[block_start + i]);
+      if (!seen[v]) {
+        seen[v] = true;
+        num_distinct++;
+      }
+    }
+
+    // Test each applicable compression method for this block
+    struct MethodInfo {
+      CompressionMethod method;
+      const char* name;
+      int required_distinct;  // 0 = any, 2 = exactly 2, 3 = exactly 3
+    };
+
+    MethodInfo methods[] = {
+      {CompressionMethod::RAW_2BIT, "RAW_2BIT", 0},
+      {CompressionMethod::RLE_BINARY_SEARCH, "RLE_BINARY_SEARCH", 0},
+      {CompressionMethod::DEFAULT_EXCEPTIONS, "DEFAULT_EXCEPTIONS", 0},
+      {CompressionMethod::RLE_HUFFMAN_2VAL, "RLE_HUFFMAN_2VAL", 2},
+      {CompressionMethod::RLE_HUFFMAN_3VAL, "RLE_HUFFMAN_3VAL", 3},
+    };
+
+    for (const auto& mi : methods) {
+      // Skip methods that don't apply to this block's value count
+      if (mi.required_distinct != 0 && mi.required_distinct != num_distinct) {
+        continue;
+      }
+
+      CompressionMethod method = mi.method;
+
+      // Compress this block
+      auto compressed = compress_block(marked.data() + block_start, block_size, method);
+
+      // Decompress
+      auto decompressed = decompress_block(compressed.data(), compressed.size(),
+                                            block_size, method);
+
+      // Verify roundtrip for quiet positions only (don't-care positions don't matter)
+      for (std::size_t i = 0; i < block_size; i++) {
+        std::size_t idx = block_start + i;
+        Board board = index_to_board(idx, m);
+
+        // Skip don't-care positions - their stored value doesn't matter
+        if (has_captures(board)) continue;
+
+        if (marked[idx] != decompressed[i]) {
+          std::cerr << "\n=== COMPRESSION ROUNDTRIP ERROR ===\n";
+          std::cerr << "Method: " << mi.name << "\n";
+          std::cerr << "Material: " << m << "\n";
+          std::cerr << "Block: " << (block_start / BLOCK_SIZE) << " (start=" << block_start << ")\n";
+          std::cerr << "Index in block: " << i << "\n";
+          std::cerr << "Global index: " << idx << "\n";
+          std::cerr << "Original (marked): " << static_cast<int>(marked[idx]) << "\n";
+          std::cerr << "Decompressed: " << static_cast<int>(decompressed[i]) << "\n";
+          std::cerr << "Board:\n" << board << "\n";
+          return false;
+        }
+      }
+    }
+  }
+
+  return true;
+}
+
+// Verify compressed lookup matches original for quiet positions
+bool verify_compressed_lookup(
+    const std::vector<Value>& original,
+    const CompressedTablebase& ctb,
+    const Material& m) {
+
+  std::size_t size = original.size();
+
+  std::atomic<bool> error_found{false};
+  std::atomic<std::size_t> error_idx{0};
+
+  #pragma omp parallel for schedule(dynamic, 1024)
+  for (std::size_t idx = 0; idx < size; ++idx) {
+    if (error_found.load(std::memory_order_relaxed)) continue;
+
+    Board board = index_to_board(idx, m);
+
+    // Skip don't-care positions
+    if (has_captures(board)) continue;
+
+    Value orig = original[idx];
+    Value compressed = lookup_compressed(ctb, idx);
+
+    if (orig != compressed) {
+      bool expected = false;
+      if (error_found.compare_exchange_strong(expected, true)) {
+        error_idx.store(idx);
+      }
+    }
+  }
+
+  if (error_found.load()) {
+    std::size_t idx = error_idx.load();
+    Board board = index_to_board(idx, m);
+    Value orig = original[idx];
+    Value compressed = lookup_compressed(ctb, idx);
+
+    std::cerr << "\n=== COMPRESSED LOOKUP ERROR ===\n";
+    std::cerr << "Material: " << m << "\n";
+    std::cerr << "Index: " << idx << "\n";
+    std::cerr << "Original: " << static_cast<int>(orig) << "\n";
+    std::cerr << "Compressed lookup: " << static_cast<int>(compressed) << "\n";
+    std::cerr << "has_captures: " << has_captures(board) << "\n";
+    std::cerr << "Board:\n" << board << "\n";
+    return false;
+  }
+
+  return true;
+}
 
 // ============================================================================
 // Global State for Parallel Generation
@@ -560,11 +870,56 @@ void generate_wdl_parallel_compressed(
   auto end = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
-  std::cout << "  [5/6] " << m << " (" << size_m << " pos): "
+  std::cout << "  [5/9] " << m << " (" << size_m << " pos): "
             << wins_m << "W/" << losses_m << "L/" << draws_m << "D, "
             << iteration << " iters, " << duration.count() << "ms" << std::endl;
 
-  std::cout << "  [6/6] Compressing and saving..." << std::endl;
+  // Also mark table_fm remaining as DRAW before verification
+  if (!symmetric) {
+    #pragma omp parallel for
+    for (std::size_t idx = 0; idx < size_fm; ++idx) {
+      if (table_fm[idx] == Value::UNKNOWN) table_fm[idx] = Value::DRAW;
+    }
+  }
+
+  // === VERIFICATION STEP 1: Verify generated values ===
+  std::cout << "  [6/9] Verifying generated tablebase..." << std::endl;
+  std::cout.flush();
+
+  if (!verify_generated_tablebase(table_m, m, table_fm, thread_managers[0].get())) {
+    std::cerr << "FATAL: Generation verification failed for " << m << "\n";
+    std::exit(1);
+  }
+  std::cout << "    " << m << ": OK" << std::endl;
+
+  if (!symmetric) {
+    if (!verify_generated_tablebase(table_fm, fm, table_m, thread_managers[0].get())) {
+      std::cerr << "FATAL: Generation verification failed for " << fm << "\n";
+      std::exit(1);
+    }
+    std::cout << "    " << fm << ": OK" << std::endl;
+  }
+
+  // === VERIFICATION STEP 2: Verify compression roundtrip ===
+  std::cout << "  [7/9] Verifying compression roundtrip..." << std::endl;
+  std::cout.flush();
+
+  if (!verify_compression_roundtrip(table_m, m)) {
+    std::cerr << "FATAL: Compression roundtrip failed for " << m << "\n";
+    std::exit(1);
+  }
+  std::cout << "    " << m << ": OK" << std::endl;
+
+  if (!symmetric) {
+    if (!verify_compression_roundtrip(table_fm, fm)) {
+      std::cerr << "FATAL: Compression roundtrip failed for " << fm << "\n";
+      std::exit(1);
+    }
+    std::cout << "    " << fm << ": OK" << std::endl;
+  }
+
+  // === COMPRESSION AND SAVE ===
+  std::cout << "  [8/9] Compressing and saving..." << std::endl;
   std::cout.flush();
 
   // Mark don't-care positions and compress
@@ -576,22 +931,30 @@ void generate_wdl_parallel_compressed(
   save_compressed_tablebase(ctb_m, filename_m);
 
   BlockCompressionStats bstats_m = analyze_block_compression(ctb_m);
-  std::cout << "  Saved " << filename_m << " ("
+  std::cout << "    Saved " << filename_m << " ("
             << bstats_m.compressed_size << " bytes, "
             << std::fixed << std::setprecision(1) << bstats_m.compression_ratio() << "x ratio)"
             << std::endl;
 
+  // === VERIFICATION STEP 3: Verify compressed lookup ===
+  std::cout << "  [9/9] Verifying compressed lookup..." << std::endl;
+  std::cout.flush();
+
+  if (!verify_compressed_lookup(table_m, ctb_m, m)) {
+    std::cerr << "FATAL: Compressed lookup verification failed for " << m << "\n";
+    std::exit(1);
+  }
+  std::cout << "    " << m << ": OK" << std::endl;
+
   if (!symmetric) {
     std::size_t wins_fm = 0, losses_fm = 0, draws_fm = 0;
-    #pragma omp parallel for reduction(+:wins_fm,losses_fm,draws_fm)
     for (std::size_t idx = 0; idx < size_fm; ++idx) {
-      if (table_fm[idx] == Value::UNKNOWN) table_fm[idx] = Value::DRAW;
       if (table_fm[idx] == Value::WIN) wins_fm++;
       else if (table_fm[idx] == Value::LOSS) losses_fm++;
       else draws_fm++;
     }
 
-    std::cout << fm << " (" << size_fm << " pos): "
+    std::cout << "    " << fm << " (" << size_fm << " pos): "
               << wins_fm << "W/" << losses_fm << "L/" << draws_fm << "D" << std::endl;
 
     CompressionStats cstats_fm;
@@ -602,13 +965,20 @@ void generate_wdl_parallel_compressed(
     save_compressed_tablebase(ctb_fm, filename_fm);
 
     BlockCompressionStats bstats_fm = analyze_block_compression(ctb_fm);
-    std::cout << "  Saved " << filename_fm << " ("
+    std::cout << "    Saved " << filename_fm << " ("
               << bstats_fm.compressed_size << " bytes, "
               << std::fixed << std::setprecision(1) << bstats_fm.compression_ratio() << "x ratio)"
               << std::endl;
+
+    // Verify compressed lookup for flip material
+    if (!verify_compressed_lookup(table_fm, ctb_fm, fm)) {
+      std::cerr << "FATAL: Compressed lookup verification failed for " << fm << "\n";
+      std::exit(1);
+    }
+    std::cout << "    " << fm << ": OK" << std::endl;
   }
 
-  // Don't cache in g_wdl_tablebases - we want to save memory
+  std::cout << "  All verifications passed.\n" << std::endl;
 }
 
 // Legacy single-threaded generate for compatibility
