@@ -947,11 +947,36 @@ void generate_wdl_parallel_compressed(
   std::cout << "  [8/9] Compressing and saving..." << std::endl;
   std::cout.flush();
 
-  // Mark don't-care positions and compress
-  CompressionStats cstats;
-  std::vector<Value> marked_m = mark_dont_care_positions(table_m, m, cstats);
-  CompressedTablebase ctb_m = compress_tablebase(marked_m, m);
+  // Compress both m and fm in parallel (if asymmetric)
+  CompressionStats cstats_m, cstats_fm;
+  std::vector<Value> marked_m, marked_fm;
+  CompressedTablebase ctb_m, ctb_fm;
+  std::size_t wins_fm = 0, losses_fm = 0, draws_fm = 0;
 
+  #pragma omp parallel sections
+  {
+    #pragma omp section
+    {
+      marked_m = mark_dont_care_positions(table_m, m, cstats_m);
+      ctb_m = compress_tablebase(marked_m, m);
+    }
+    #pragma omp section
+    {
+      if (!symmetric) {
+        marked_fm = mark_dont_care_positions(table_fm, fm, cstats_fm);
+        ctb_fm = compress_tablebase(marked_fm, fm);
+
+        // Count stats for fm
+        for (std::size_t idx = 0; idx < size_fm; ++idx) {
+          if (table_fm[idx] == Value::WIN) wins_fm++;
+          else if (table_fm[idx] == Value::LOSS) losses_fm++;
+          else draws_fm++;
+        }
+      }
+    }
+  }
+
+  // Save and report results (sequential for clean output)
   std::string filename_m = tb_directory + "/" + compressed_tablebase_filename(m);
   save_compressed_tablebase(ctb_m, filename_m);
 
@@ -972,19 +997,8 @@ void generate_wdl_parallel_compressed(
   std::cout << "    " << m << ": OK" << std::endl;
 
   if (!symmetric) {
-    std::size_t wins_fm = 0, losses_fm = 0, draws_fm = 0;
-    for (std::size_t idx = 0; idx < size_fm; ++idx) {
-      if (table_fm[idx] == Value::WIN) wins_fm++;
-      else if (table_fm[idx] == Value::LOSS) losses_fm++;
-      else draws_fm++;
-    }
-
     std::cout << "    " << fm << " (" << size_fm << " pos): "
               << wins_fm << "W/" << losses_fm << "L/" << draws_fm << "D" << std::endl;
-
-    CompressionStats cstats_fm;
-    std::vector<Value> marked_fm = mark_dont_care_positions(table_fm, fm, cstats_fm);
-    CompressedTablebase ctb_fm = compress_tablebase(marked_fm, fm);
 
     std::string filename_fm = tb_directory + "/" + compressed_tablebase_filename(fm);
     save_compressed_tablebase(ctb_fm, filename_fm);
