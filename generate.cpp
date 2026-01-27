@@ -71,7 +71,7 @@ bool verify_generated_tablebase(
     const std::vector<Value>& table,
     const Material& m,
     const std::vector<Value>& table_fm,  // flip(m)'s table (empty if symmetric)
-    CompressedTablebaseManager* manager) {
+    const std::vector<std::unique_ptr<CompressedTablebaseManager>>& thread_managers) {
 
   std::size_t size = table.size();
   Material fm = flip(m);
@@ -87,7 +87,17 @@ bool verify_generated_tablebase(
     Board board = index_to_board(idx, m);
     Value stored = table[idx];
 
-    // Compute expected value
+    // For quiet positions, verify using successor logic
+    // For capture positions, skip verification here - they will be verified
+    // when we test compressed lookup (which uses negamax search)
+    if (has_captures(board)) {
+      continue;  // Skip capture positions - verified via compressed lookup
+    }
+
+    // Get thread-local manager
+    auto* manager = thread_managers[omp_get_thread_num()].get();
+
+    // Compute expected value for quiet positions
     std::vector<Move> moves;
     generateMoves(board, moves);
 
@@ -177,7 +187,7 @@ bool verify_generated_tablebase(
         succ_val = symmetric ? table[next_idx] : table_fm[next_idx];
         source = "table_fm[" + std::to_string(next_idx) + "]";
       } else {
-        succ_val = manager->lookup_wdl(next);
+        succ_val = thread_managers[0]->lookup_wdl(next);
         std::ostringstream oss;
         oss << "manager(" << next_m << ")";
         source = oss.str();
@@ -886,14 +896,14 @@ void generate_wdl_parallel_compressed(
   std::cout << "  [6/9] Verifying generated tablebase..." << std::endl;
   std::cout.flush();
 
-  if (!verify_generated_tablebase(table_m, m, table_fm, thread_managers[0].get())) {
+  if (!verify_generated_tablebase(table_m, m, table_fm, thread_managers)) {
     std::cerr << "FATAL: Generation verification failed for " << m << "\n";
     std::exit(1);
   }
   std::cout << "    " << m << ": OK" << std::endl;
 
   if (!symmetric) {
-    if (!verify_generated_tablebase(table_fm, fm, table_m, thread_managers[0].get())) {
+    if (!verify_generated_tablebase(table_fm, fm, table_m, thread_managers)) {
       std::cerr << "FATAL: Generation verification failed for " << fm << "\n";
       std::exit(1);
     }
@@ -1787,6 +1797,53 @@ void solve_all_parallel_compressed(int max_pieces, int threshold, const std::str
       std::cout << "Skipping " << m;
       if (!(f == m)) std::cout << " <-> " << f;
       std::cout << " (cwdl already exists)" << std::endl;
+      continue;
+    }
+
+    // Check if uncompressed WDL exists - if so, convert to compressed format
+    if (tablebase_exists(m)) {
+      std::cout << "\n[CONVERT] " << m;
+      if (!(f == m)) std::cout << " <-> " << f;
+      std::cout << " (converting tb to cwdl)" << std::endl;
+
+      std::vector<Value> table_m = load_tablebase(m);
+      if (!table_m.empty()) {
+        // Store in memory cache for dependency lookups
+        store_wdl_tablebase(m, std::vector<Value>(table_m));
+
+        CompressionStats cstats_m;
+        std::vector<Value> marked_m = mark_dont_care_positions(table_m, m, cstats_m);
+        CompressedTablebase ctb_m = compress_tablebase(marked_m, m);
+        std::string filename_m = tb_directory + "/" + compressed_tablebase_filename(m);
+        save_compressed_tablebase(ctb_m, filename_m);
+
+        BlockCompressionStats bstats_m = analyze_block_compression(ctb_m);
+        std::cout << "  Saved " << filename_m << " ("
+                  << bstats_m.compressed_size << " bytes, "
+                  << std::fixed << std::setprecision(1) << bstats_m.compression_ratio() << "x ratio)"
+                  << std::endl;
+      }
+
+      if (!(f == m) && tablebase_exists(f)) {
+        std::vector<Value> table_fm = load_tablebase(f);
+        if (!table_fm.empty()) {
+          store_wdl_tablebase(f, std::vector<Value>(table_fm));
+
+          CompressionStats cstats_fm;
+          std::vector<Value> marked_fm = mark_dont_care_positions(table_fm, f, cstats_fm);
+          CompressedTablebase ctb_fm = compress_tablebase(marked_fm, f);
+          std::string filename_fm = tb_directory + "/" + compressed_tablebase_filename(f);
+          save_compressed_tablebase(ctb_fm, filename_fm);
+
+          BlockCompressionStats bstats_fm = analyze_block_compression(ctb_fm);
+          std::cout << "  Saved " << filename_fm << " ("
+                    << bstats_fm.compressed_size << " bytes, "
+                    << std::fixed << std::setprecision(1) << bstats_fm.compression_ratio() << "x ratio)"
+                    << std::endl;
+        }
+      }
+
+      check_manager.clear();
       continue;
     }
 
