@@ -8,10 +8,10 @@ OBJS = $(SRCS:.cpp=.o)
 all: damas test generate lookup verify longest_mate play_optimal compress
 
 damas: $(OBJS) main.o
-	$(CXX) $(CXXFLAGS) -o $@ $^
+	$(CXX) $(CXXFLAGS) $(OMPFLAGS) -o $@ $^
 
 test: $(OBJS) test.o
-	$(CXX) $(CXXFLAGS) -o $@ $^
+	$(CXX) $(CXXFLAGS) $(OMPFLAGS) -o $@ $^
 
 generate: $(OBJS) generate.o
 	$(CXX) $(CXXFLAGS) $(OMPFLAGS) -o $@ $^
@@ -19,8 +19,11 @@ generate: $(OBJS) generate.o
 generate.o: generate.cpp
 	$(CXX) $(CXXFLAGS) $(OMPFLAGS) -c -o $@ $<
 
+compression.o: compression.cpp
+	$(CXX) $(CXXFLAGS) $(OMPFLAGS) -c -o $@ $<
+
 lookup: $(OBJS) lookup.o
-	$(CXX) $(CXXFLAGS) -o $@ $^
+	$(CXX) $(CXXFLAGS) $(OMPFLAGS) -o $@ $^
 
 verify: $(OBJS) verify.o
 	$(CXX) $(CXXFLAGS) $(OMPFLAGS) -o $@ $^
@@ -29,13 +32,13 @@ verify.o: verify.cpp
 	$(CXX) $(CXXFLAGS) $(OMPFLAGS) -c -o $@ $<
 
 longest_mate: $(OBJS) longest_mate.o
-	$(CXX) $(CXXFLAGS) -o $@ $^
+	$(CXX) $(CXXFLAGS) $(OMPFLAGS) -o $@ $^
 
 play_optimal: $(OBJS) play_optimal.o
-	$(CXX) $(CXXFLAGS) -o $@ $^
+	$(CXX) $(CXXFLAGS) $(OMPFLAGS) -o $@ $^
 
 compress: $(OBJS) compress.o
-	$(CXX) $(CXXFLAGS) -o $@ $^
+	$(CXX) $(CXXFLAGS) $(OMPFLAGS) -o $@ $^
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c -o $@ $<
