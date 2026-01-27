@@ -1262,10 +1262,10 @@ std::vector<Value> decompress_rle_huffman_2val(const std::uint8_t* data, std::si
 }
 
 // Lookup a single value from Huffman 2-val encoded data by iterating through runs.
-static Value lookup_rle_huffman_2val(const std::uint8_t* data, std::size_t /*data_size*/,
+static Value lookup_rle_huffman_2val(const std::uint8_t* data, std::size_t data_size,
                                       std::size_t target_idx) {
-  // Check for single-value block marker
-  if (data[1] == 0) {
+  // Check for single-value block marker (2-byte format: value byte + 0x00 marker)
+  if (data_size == 2 && data[1] == 0) {
     return int_to_value(data[0] & 0x3);
   }
 
@@ -1791,10 +1791,10 @@ std::vector<Value> decompress_rle_huffman_3val(const std::uint8_t* data, std::si
 }
 
 // Lookup a single value from Huffman 3-val encoded data by iterating through runs.
-static Value lookup_rle_huffman_3val(const std::uint8_t* data, std::size_t /*data_size*/,
+static Value lookup_rle_huffman_3val(const std::uint8_t* data, std::size_t data_size,
                                       std::size_t target_idx) {
-  // Check for single-value block marker
-  if (data[1] == 0) {
+  // Check for single-value block marker (2-byte format: value byte + 0x00 marker)
+  if (data_size == 2 && data[1] == 0) {
     return int_to_value(data[0] & 0x3);
   }
 
