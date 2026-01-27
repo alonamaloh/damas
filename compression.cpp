@@ -8,6 +8,7 @@
 #include <iomanip>
 #include <iostream>
 #include <mutex>
+#include <omp.h>
 #include <unordered_set>
 
 // Forward declarations for optimized 2-value RLE
@@ -93,6 +94,11 @@ std::vector<Value> mark_dont_care_positions(
 
   std::vector<Value> result(original.size());
 
+  // Use reduction for statistics counters
+  std::size_t dont_care = 0, real = 0, opp_capture = 0;
+  std::size_t wins = 0, losses = 0, draws = 0;
+
+  #pragma omp parallel for reduction(+:dont_care,real,opp_capture,wins,losses,draws)
   for (std::size_t idx = 0; idx < original.size(); ++idx) {
     Board board = index_to_board(idx, m);
     Value val = original[idx];
@@ -101,26 +107,33 @@ std::vector<Value> mark_dont_care_positions(
     bool we_have_captures = has_captures(board);
 
     if (we_have_captures) {
-      stats.dont_care_positions++;
+      dont_care++;
       result[idx] = Value::UNKNOWN;  // Use UNKNOWN as sentinel for don't-care
     } else {
-      stats.real_positions++;
+      real++;
       result[idx] = val;
     }
 
     // Also track opponent captures for analysis (not used for don't-care)
     if (!we_have_captures && has_captures(flip(board))) {
-      stats.opponent_capture_positions++;
+      opp_capture++;
     }
 
     // Count original values
     switch (val) {
-      case Value::WIN: stats.wins++; break;
-      case Value::LOSS: stats.losses++; break;
-      case Value::DRAW: stats.draws++; break;
+      case Value::WIN: wins++; break;
+      case Value::LOSS: losses++; break;
+      case Value::DRAW: draws++; break;
       default: break;
     }
   }
+
+  stats.dont_care_positions = dont_care;
+  stats.real_positions = real;
+  stats.opponent_capture_positions = opp_capture;
+  stats.wins = wins;
+  stats.losses = losses;
+  stats.draws = draws;
 
   return result;
 }
@@ -719,16 +732,19 @@ CompressedTablebase compress_tablebase(
   tb.num_positions = values.size();
   tb.num_blocks = static_cast<std::uint32_t>((tb.num_positions + BLOCK_SIZE - 1) / BLOCK_SIZE);
 
-  tb.block_offsets.reserve(tb.num_blocks);
+  // Structure to hold per-block compression results
+  struct BlockResult {
+    CompressionMethod method;
+    std::vector<std::uint8_t> data;
+  };
+  std::vector<BlockResult> block_results(tb.num_blocks);
 
-  // Compress each block
+  // Compress blocks in parallel
+  #pragma omp parallel for schedule(dynamic)
   for (std::uint32_t block_idx = 0; block_idx < tb.num_blocks; ++block_idx) {
     std::size_t block_start = static_cast<std::size_t>(block_idx) * BLOCK_SIZE;
     std::size_t block_end = std::min(block_start + BLOCK_SIZE, values.size());
     std::size_t num_values = block_end - block_start;
-
-    // Record offset
-    tb.block_offsets.push_back(static_cast<std::uint32_t>(tb.block_data.size()));
 
     // Extend runs through tense positions for better compression.
     // Tense positions (where captures available) don't need correct values stored
@@ -739,14 +755,34 @@ CompressedTablebase compress_tablebase(
     // Find best compression using the extended values
     auto [method, compressed] = compress_block_best(extended.data(), num_values);
 
+    block_results[block_idx].method = method;
+    block_results[block_idx].data = std::move(compressed);
+  }
+
+  // Sequentially assemble the compressed tablebase
+  tb.block_offsets.reserve(tb.num_blocks);
+
+  // Estimate total size to avoid reallocations
+  std::size_t total_data_size = 0;
+  for (const auto& br : block_results) {
+    total_data_size += 3 + br.data.size();  // 3 bytes header + data
+  }
+  tb.block_data.reserve(total_data_size);
+
+  for (std::uint32_t block_idx = 0; block_idx < tb.num_blocks; ++block_idx) {
+    const auto& br = block_results[block_idx];
+
+    // Record offset
+    tb.block_offsets.push_back(static_cast<std::uint32_t>(tb.block_data.size()));
+
     // Write block header: method (1 byte) + size (2 bytes) + data
-    tb.block_data.push_back(static_cast<std::uint8_t>(method));
-    std::uint16_t size = static_cast<std::uint16_t>(compressed.size());
+    tb.block_data.push_back(static_cast<std::uint8_t>(br.method));
+    std::uint16_t size = static_cast<std::uint16_t>(br.data.size());
     tb.block_data.push_back(size & 0xFF);
     tb.block_data.push_back((size >> 8) & 0xFF);
 
     // Write compressed data
-    tb.block_data.insert(tb.block_data.end(), compressed.begin(), compressed.end());
+    tb.block_data.insert(tb.block_data.end(), br.data.begin(), br.data.end());
   }
 
   return tb;
