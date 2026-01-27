@@ -227,8 +227,15 @@ bool verify_compression_roundtrip(
   CompressionStats cstats;
   std::vector<Value> marked = mark_dont_care_positions(original, m, cstats);
 
-  // Test block by block (compression methods are designed for BLOCK_SIZE chunks)
-  for (std::size_t block_start = 0; block_start < size; block_start += BLOCK_SIZE) {
+  std::size_t num_blocks = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
+  bool has_error = false;
+
+  // Test block by block in parallel
+  #pragma omp parallel for schedule(dynamic)
+  for (std::size_t block_idx = 0; block_idx < num_blocks; ++block_idx) {
+    if (has_error) continue;  // Skip remaining work if error found
+
+    std::size_t block_start = block_idx * BLOCK_SIZE;
     std::size_t block_end = std::min(block_start + BLOCK_SIZE, size);
     std::size_t block_size = block_end - block_start;
 
@@ -259,6 +266,8 @@ bool verify_compression_roundtrip(
     };
 
     for (const auto& mi : methods) {
+      if (has_error) break;
+
       // Skip methods that don't apply to this block's value count
       if (mi.required_distinct != 0 && mi.required_distinct != num_distinct) {
         continue;
@@ -282,22 +291,28 @@ bool verify_compression_roundtrip(
         if (has_captures(board)) continue;
 
         if (marked[idx] != decompressed[i]) {
-          std::cerr << "\n=== COMPRESSION ROUNDTRIP ERROR ===\n";
-          std::cerr << "Method: " << mi.name << "\n";
-          std::cerr << "Material: " << m << "\n";
-          std::cerr << "Block: " << (block_start / BLOCK_SIZE) << " (start=" << block_start << ")\n";
-          std::cerr << "Index in block: " << i << "\n";
-          std::cerr << "Global index: " << idx << "\n";
-          std::cerr << "Original (marked): " << static_cast<int>(marked[idx]) << "\n";
-          std::cerr << "Decompressed: " << static_cast<int>(decompressed[i]) << "\n";
-          std::cerr << "Board:\n" << board << "\n";
-          return false;
+          #pragma omp critical
+          {
+            if (!has_error) {
+              std::cerr << "\n=== COMPRESSION ROUNDTRIP ERROR ===\n";
+              std::cerr << "Method: " << mi.name << "\n";
+              std::cerr << "Material: " << m << "\n";
+              std::cerr << "Block: " << block_idx << " (start=" << block_start << ")\n";
+              std::cerr << "Index in block: " << i << "\n";
+              std::cerr << "Global index: " << idx << "\n";
+              std::cerr << "Original (marked): " << static_cast<int>(marked[idx]) << "\n";
+              std::cerr << "Decompressed: " << static_cast<int>(decompressed[i]) << "\n";
+              std::cerr << "Board:\n" << board << "\n";
+              has_error = true;
+            }
+          }
+          break;
         }
       }
     }
   }
 
-  return true;
+  return !has_error;
 }
 
 // Verify compressed lookup matches original for quiet positions
