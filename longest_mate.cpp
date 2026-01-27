@@ -1,9 +1,29 @@
 #include "tablebase.h"
 #include "board.h"
+#include "movegen.h"
+#include "notation.h"
 #include <iostream>
 #include <vector>
 #include <algorithm>
 #include <iomanip>
+#include <map>
+#include <set>
+#include <unordered_map>
+
+// Cache for DTM lookups
+std::unordered_map<Material, std::vector<DTM>> dtm_cache;
+
+DTM lookup_dtm(const Board& b) {
+  Material m = get_material(b);
+  if (dtm_cache.find(m) == dtm_cache.end()) {
+    dtm_cache[m] = load_dtm(m);
+  }
+  auto& tb = dtm_cache[m];
+  if (tb.empty()) return DTM_UNKNOWN;
+  std::size_t idx = board_to_index(b, m);
+  if (idx >= tb.size()) return DTM_UNKNOWN;
+  return tb[idx];
+}
 
 // Generate all material configurations with up to n total pieces
 std::vector<Material> all_materials(int max_pieces) {
@@ -33,7 +53,7 @@ std::vector<Material> all_materials(int max_pieces) {
   return result;
 }
 
-// Convert material to a human-readable string like "KK" or "KPK" or "KPPKP"
+// Convert material to a human-readable string like "KKK" or "KPP"
 std::string material_string(const Material& m) {
   std::string result;
 
@@ -58,7 +78,7 @@ int to_notation(int sq) {
 
 // Print board position with piece locations
 void print_position(const Board& b) {
-  std::cout << "  Position: ";
+  std::cout << "Position: ";
 
   // White pieces
   std::cout << "W(";
@@ -101,8 +121,97 @@ struct LongestMate {
   int plies;
 };
 
+// Show optimal play from a winning position
+void show_optimal_play(Board b, int expected_plies) {
+  std::set<std::uint64_t> seen_positions;
+  std::vector<FullMove> game_moves;
+  int ply = 0;
+
+  while (ply < expected_plies + 10) {
+    Material cur_m = get_material(b);
+    DTM current_dtm = lookup_dtm(b);
+
+    // After a move+flip, if side to move has no pieces, previous side won
+    if (cur_m.white_pieces() == 0) {
+      // Previous side captured all opponent pieces
+      break;
+    }
+
+    // Check for repetition
+    std::uint64_t pos_hash = b.hash();
+    if (seen_positions.count(pos_hash)) {
+      std::cout << "(DRAW by repetition)\n";
+      break;
+    }
+    seen_positions.insert(pos_hash);
+
+    std::vector<FullMove> moves;
+    generateFullMoves(b, moves);
+
+    if (moves.empty()) {
+      // No moves = loss (stalemate is a loss in Spanish checkers)
+      break;
+    }
+
+    // Find best move based on DTM
+    // - For winning (DTM>0): find move giving opponent largest (least negative) loss DTM
+    //   because larger (less negative) means faster loss for opponent
+    // - For losing (DTM<0): find move giving opponent largest win DTM (slowest win)
+    FullMove best_move;
+    DTM best_opp_dtm = DTM_UNKNOWN;
+    bool found = false;
+
+    for (const auto& mv : moves) {
+      Board next = makeMove(b, mv.move);
+      Material next_m = get_material(next);
+
+      // Terminal capture
+      DTM opp_dtm = (next_m.white_pieces() == 0) ? DTM_LOSS_TERMINAL : lookup_dtm(next);
+
+      if (opp_dtm == DTM_UNKNOWN) continue;
+
+      bool dominated = false;
+      if (!found) {
+        dominated = false;
+      } else if (current_dtm > 0) {
+        // Winning: prefer moves where opponent loses, and among those, faster loss
+        if (best_opp_dtm < 0 && opp_dtm >= 0) dominated = true;
+        else if (best_opp_dtm >= 0 && opp_dtm < 0) dominated = false;
+        else if (best_opp_dtm < 0 && opp_dtm < 0) dominated = (opp_dtm <= best_opp_dtm);
+        else dominated = true;
+      } else if (current_dtm < 0) {
+        // Losing: pick move with largest opp_dtm (slowest win for opponent)
+        dominated = (opp_dtm <= best_opp_dtm);
+      } else {
+        dominated = (opp_dtm <= best_opp_dtm);
+      }
+
+      if (!dominated) {
+        best_opp_dtm = opp_dtm;
+        best_move = mv;
+        found = true;
+      }
+    }
+
+    if (!found) break;
+
+    game_moves.push_back(best_move);
+    b = makeMove(b, best_move.move);
+    ply++;
+  }
+
+  // Print the game
+  std::cout << gameToString(game_moves) << "\n";
+
+  if ((int)game_moves.size() != expected_plies) {
+    std::cout << "(Game length: " << game_moves.size() << " plies, expected " << expected_plies << ")\n";
+  }
+}
+
 int main(int argc, char* argv[]) {
   int max_pieces = 6;
+  bool show_play = true;
+
   if (argc > 1) {
     max_pieces = std::atoi(argv[1]);
     if (max_pieces < 2 || max_pieces > 8) {
@@ -110,15 +219,19 @@ int main(int argc, char* argv[]) {
       return 1;
     }
   }
+  if (argc > 2 && std::string(argv[2]) == "--no-play") {
+    show_play = false;
+  }
 
-  std::cout << "Finding longest mates for all " << max_pieces << "-men tablebases" << std::endl;
-  std::cout << "========================================" << std::endl << std::endl;
+  std::cout << "Finding longest winning positions for " << max_pieces << "-piece tablebases\n";
+  std::cout << std::string(60, '=') << "\n\n";
 
   std::vector<Material> all = all_materials(max_pieces);
-  std::vector<LongestMate> results;
+
+  // Group by piece count, find longest mate for each
+  std::map<int, LongestMate> best_by_count;
 
   for (const Material& m : all) {
-    // Skip if no DTM tablebase exists
     if (!dtm_exists(m)) {
       continue;
     }
@@ -140,36 +253,38 @@ int main(int argc, char* argv[]) {
     }
 
     if (max_dtm > 0) {
-      results.push_back({m, max_idx, max_dtm, dtm_to_plies(max_dtm)});
+      int pieces = m.total_pieces();
+      int plies = dtm_to_plies(max_dtm);
+
+      if (best_by_count.find(pieces) == best_by_count.end() ||
+          plies > best_by_count[pieces].plies) {
+        best_by_count[pieces] = {m, max_idx, max_dtm, plies};
+      }
     }
   }
 
-  // Sort by longest mate first
-  std::sort(results.begin(), results.end(), [](const LongestMate& a, const LongestMate& b) {
-    return a.plies > b.plies;
-  });
+  // Print results for each piece count
+  for (int pieces = 2; pieces <= max_pieces; pieces++) {
+    std::cout << "=== " << pieces << " PIECES ===\n";
 
-  // Print results
-  std::cout << "Results (sorted by longest mate):" << std::endl;
-  std::cout << std::string(60, '-') << std::endl;
+    if (best_by_count.find(pieces) == best_by_count.end()) {
+      std::cout << "No winning positions found\n\n";
+      continue;
+    }
 
-  for (const LongestMate& lm : results) {
+    const LongestMate& lm = best_by_count[pieces];
     Board b = index_to_board(lm.index, lm.material);
 
-    std::cout << std::left << std::setw(12) << material_string(lm.material)
-              << " DTM=" << std::setw(4) << lm.dtm
-              << " (" << std::setw(3) << lm.plies << " plies)"
-              << std::endl;
+    std::cout << "Longest mate: " << lm.dtm << " moves (" << lm.plies << " plies)\n";
+    std::cout << "Material: " << material_string(lm.material) << "\n";
     print_position(b);
-    std::cout << b << std::endl;
-  }
+    std::cout << b;
 
-  std::cout << std::string(60, '-') << std::endl;
-  std::cout << "Total material configurations with wins: " << results.size() << std::endl;
-
-  if (!results.empty()) {
-    std::cout << "\nOverall longest mate: " << material_string(results[0].material)
-              << " with " << results[0].plies << " plies" << std::endl;
+    if (show_play) {
+      std::cout << "\nOptimal play:\n";
+      show_optimal_play(b, lm.plies);
+    }
+    std::cout << "\n";
   }
 
   return 0;
