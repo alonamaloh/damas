@@ -183,6 +183,28 @@ std::vector<DTM> load_dtm(const Material& m);
 bool dtm_exists(const Material& m);
 
 // ============================================================================
+// Index decomposition (for block-decomposed generation)
+// ============================================================================
+
+// Queen space size: number of queen arrangements for a given pawn placement
+// = C(n, wq) * C(n-wq, bq) where n = 32 - total_pawns
+std::size_t queen_space_size(const Material& m);
+
+// Pawn space size: number of distinct pawn arrangements
+// = material_size(m) / queen_space_size(m)
+std::size_t pawn_space_size(const Material& m);
+
+// Decompose pawn_index into pawn bitboards (white_pawns, black_pawns)
+std::pair<Bb, Bb> index_to_pawn_bits(std::size_t pawn_index, const Material& m);
+
+// Compute pawn_index from pawn bitboards
+std::size_t pawn_bits_to_index(Bb wp, Bb bp, const Material& m);
+
+// Given a pawn_index in material m, compute the companion pawn_index in flip(m)
+// (flip the board, swap colors, re-encode)
+std::size_t companion_pawn_index(std::size_t pawn_index, const Material& m);
+
+// ============================================================================
 // Combinatorics helper
 // ============================================================================
 

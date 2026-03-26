@@ -19,6 +19,10 @@
 #include <condition_variable>
 #include <atomic>
 #include <omp.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace {
 
@@ -1020,6 +1024,584 @@ void generate_wdl_parallel_compressed(
   std::cout << "  All verifications passed.\n" << std::endl;
 }
 
+// ============================================================================
+// Memory-mapped temporary file for block-decomposed generation
+// ============================================================================
+
+struct MmapTempFile {
+  std::string path;
+  int fd = -1;
+  std::size_t size = 0;
+  Value* data = nullptr;
+
+  MmapTempFile() = default;
+
+  MmapTempFile(const std::string& filepath, std::size_t num_bytes)
+      : path(filepath), size(num_bytes) {
+    fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+      throw std::runtime_error("Failed to create temp file: " + path);
+    }
+    // Pre-allocate to ensure disk space and avoid SIGBUS
+    if (::fallocate(fd, 0, 0, static_cast<off_t>(size)) != 0) {
+      ::close(fd);
+      ::unlink(path.c_str());
+      throw std::runtime_error("Failed to allocate " +
+          std::to_string(size) + " bytes for: " + path);
+    }
+    void* ptr = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (ptr == MAP_FAILED) {
+      ::close(fd);
+      ::unlink(path.c_str());
+      throw std::runtime_error("Failed to mmap temp file: " + path);
+    }
+    data = reinterpret_cast<Value*>(ptr);
+    // Pages are zero-initialized by OS, which matches Value::UNKNOWN = 0
+  }
+
+  ~MmapTempFile() {
+    if (data) ::munmap(data, size);
+    if (fd >= 0) ::close(fd);
+    if (!path.empty()) ::unlink(path.c_str());
+  }
+
+  MmapTempFile(const MmapTempFile&) = delete;
+  MmapTempFile& operator=(const MmapTempFile&) = delete;
+
+  MmapTempFile(MmapTempFile&& other) noexcept
+      : path(std::move(other.path)), fd(other.fd),
+        size(other.size), data(other.data) {
+    other.fd = -1;
+    other.size = 0;
+    other.data = nullptr;
+    other.path.clear();
+  }
+
+  MmapTempFile& operator=(MmapTempFile&& other) noexcept {
+    if (this != &other) {
+      if (data) ::munmap(data, size);
+      if (fd >= 0) ::close(fd);
+      if (!path.empty()) ::unlink(path.c_str());
+      path = std::move(other.path);
+      fd = other.fd;
+      size = other.size;
+      data = other.data;
+      other.fd = -1;
+      other.size = 0;
+      other.data = nullptr;
+      other.path.clear();
+    }
+    return *this;
+  }
+};
+
+// ============================================================================
+// Block-decomposed WDL generator (for large asymmetric materials)
+// ============================================================================
+
+// Compute position value within a block, using:
+// - block arrays for queen moves (within the current block pair)
+// - mmap temp files for pawn advances (to earlier blocks)
+// - CompressedTablebaseManager for material-changing moves
+Value compute_position_value_block(
+    std::size_t queen_idx,
+    std::size_t pawn_idx,
+    const Material& m,
+    const Material& fm,
+    std::size_t qss,
+    std::size_t comp_pawn_idx,
+    const std::vector<Value>& /*block_m*/,
+    const std::vector<Value>& block_fm,
+    const Value* tmp_fm_data,
+    CompressedTablebaseManager* manager) {
+
+  std::size_t full_idx = pawn_idx * qss + queen_idx;
+  Board board = index_to_board(full_idx, m);
+  std::vector<Move> moves;
+  generateMoves(board, moves);
+
+  if (moves.empty()) return Value::LOSS;
+
+  bool found_loss = false;
+  bool has_draw = false;
+  bool has_unknown = false;
+  std::size_t num_wins = 0;
+
+  for (const Move& move : moves) {
+    Board next = makeMove(board, move);
+    Material next_m = get_material(next);
+
+    Value succ_val = Value::UNKNOWN;
+
+    if (next_m.white_pieces() == 0) {
+      succ_val = Value::LOSS;
+    } else if (next_m.black_pieces() == 0) {
+      succ_val = Value::WIN;
+    } else if (next_m == fm) {
+      // Same material after flip — either queen move or pawn advance
+      std::size_t next_full_idx = board_to_index(next, fm);
+      std::size_t next_pawn = next_full_idx / qss;
+      std::size_t next_queen = next_full_idx % qss;
+
+      if (next_pawn == comp_pawn_idx) {
+        // Queen move: lookup in companion block (in memory)
+        succ_val = block_fm[next_queen];
+      } else {
+        // Pawn advance: lookup in temp file (already resolved)
+        succ_val = tmp_fm_data[next_full_idx];
+      }
+    } else {
+      // Material-changing move: lookup in compressed tablebase
+      succ_val = manager->lookup_wdl(next);
+    }
+
+    if (succ_val == Value::LOSS) {
+      found_loss = true;
+    } else if (succ_val == Value::WIN) {
+      num_wins++;
+    } else if (succ_val == Value::DRAW) {
+      has_draw = true;
+    } else {
+      has_unknown = true;
+    }
+  }
+
+  if (found_loss) return Value::WIN;
+  if (num_wins == moves.size()) return Value::LOSS;
+  if (!has_unknown && has_draw) return Value::DRAW;
+  if (!has_unknown) return Value::DRAW;
+  return Value::UNKNOWN;
+}
+
+// Stream-compress a temp file into a CompressedTablebase
+CompressedTablebase compress_from_mmap(
+    const Value* data,
+    std::size_t total_positions,
+    const Material& m) {
+
+  CompressedTablebase tb;
+  tb.material = m;
+  tb.num_positions = total_positions;
+  tb.num_blocks = static_cast<std::uint32_t>(
+      (total_positions + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+  struct BlockResult {
+    CompressionMethod method;
+    std::vector<std::uint8_t> compressed;
+  };
+  std::vector<BlockResult> block_results(tb.num_blocks);
+
+  // Compress blocks in parallel
+  #pragma omp parallel for schedule(dynamic)
+  for (std::uint32_t block_idx = 0; block_idx < tb.num_blocks; ++block_idx) {
+    std::size_t block_start = static_cast<std::size_t>(block_idx) * BLOCK_SIZE;
+    std::size_t block_end = std::min(block_start + BLOCK_SIZE, total_positions);
+    std::size_t count = block_end - block_start;
+
+    // Extend tense positions for better compression
+    std::vector<Value> extended(count);
+    Value prev_value = (block_start > 0) ? data[block_start - 1] : Value::DRAW;
+    for (std::size_t i = 0; i < count; ++i) {
+      Board board = index_to_board(block_start + i, m);
+      if (has_captures(board)) {
+        extended[i] = prev_value;
+      } else {
+        extended[i] = data[block_start + i];
+        prev_value = extended[i];
+      }
+    }
+
+    auto [method, compressed] = compress_block_best(extended.data(), count);
+    block_results[block_idx] = {method, std::move(compressed)};
+  }
+
+  // Assemble compressed tablebase
+  std::size_t total_data_size = 0;
+  for (const auto& br : block_results) {
+    total_data_size += 3 + br.compressed.size();
+  }
+  tb.block_offsets.reserve(tb.num_blocks);
+  tb.block_data.reserve(total_data_size);
+
+  for (std::uint32_t block_idx = 0; block_idx < tb.num_blocks; ++block_idx) {
+    const auto& br = block_results[block_idx];
+    tb.block_offsets.push_back(static_cast<std::uint32_t>(tb.block_data.size()));
+    tb.block_data.push_back(static_cast<std::uint8_t>(br.method));
+    std::uint16_t sz = static_cast<std::uint16_t>(br.compressed.size());
+    tb.block_data.push_back(sz & 0xFF);
+    tb.block_data.push_back((sz >> 8) & 0xFF);
+    tb.block_data.insert(tb.block_data.end(),
+                         br.compressed.begin(), br.compressed.end());
+  }
+
+  return tb;
+}
+
+// Verify compressed lookup against mmap data (streaming)
+bool verify_compressed_lookup_mmap(
+    const Value* data,
+    const CompressedTablebase& ctb,
+    const Material& m) {
+
+  std::size_t total = ctb.num_positions;
+  std::atomic<bool> error_found{false};
+
+  #pragma omp parallel for schedule(dynamic, 1024)
+  for (std::size_t idx = 0; idx < total; ++idx) {
+    if (error_found.load(std::memory_order_relaxed)) continue;
+
+    Board board = index_to_board(idx, m);
+    if (has_captures(board)) continue;
+
+    Value expected = data[idx];
+    Value got = lookup_compressed(ctb, idx);
+    if (got != expected) {
+      bool was_false = false;
+      if (error_found.compare_exchange_strong(was_false, true)) {
+        std::cerr << "\nCompressed lookup mismatch at idx=" << idx
+                  << " expected=" << static_cast<int>(expected)
+                  << " got=" << static_cast<int>(got) << "\n";
+      }
+    }
+  }
+
+  return !error_found.load();
+}
+
+// Main block-decomposed generation function
+void generate_wdl_block_decomposed(
+    const Material& m,
+    const std::string& tb_directory) {
+
+  Material fm = flip(m);
+  std::size_t qss = queen_space_size(m);
+  std::size_t pss = pawn_space_size(m);
+  std::size_t total = material_size(m);
+
+  std::cout << "\n[BLOCK-DECOMPOSED] " << m << " <-> " << fm
+            << " (" << m.total_pieces() << " pieces)" << std::endl;
+  std::cout << "  Pawn blocks: " << pss << ", Queen space: " << qss
+            << ", Total: " << total << std::endl;
+
+  // Create thread-local managers for compressed TB lookups
+  int num_threads = omp_get_max_threads();
+  std::vector<std::unique_ptr<CompressedTablebaseManager>> thread_managers;
+  for (int i = 0; i < num_threads; ++i) {
+    thread_managers.push_back(
+        std::make_unique<CompressedTablebaseManager>(tb_directory));
+  }
+
+  // Create temp files
+  std::string tmp_m_path = tb_directory + "/tmp_wdl_" +
+      std::to_string(m.back_white_pawns) + std::to_string(m.back_black_pawns) +
+      std::to_string(m.other_white_pawns) + std::to_string(m.other_black_pawns) +
+      std::to_string(m.white_queens) + std::to_string(m.black_queens) + ".tmp";
+  std::string tmp_fm_path = tb_directory + "/tmp_wdl_" +
+      std::to_string(fm.back_white_pawns) + std::to_string(fm.back_black_pawns) +
+      std::to_string(fm.other_white_pawns) + std::to_string(fm.other_black_pawns) +
+      std::to_string(fm.white_queens) + std::to_string(fm.black_queens) + ".tmp";
+
+  std::cout << "  Creating temp files (" << (total / (1024*1024*1024))
+            << " GB each)..." << std::endl;
+
+  MmapTempFile tmp_m(tmp_m_path, total);
+  MmapTempFile tmp_fm(tmp_fm_path, total);
+
+  auto total_start = std::chrono::high_resolution_clock::now();
+
+  std::size_t total_wins_m = 0, total_losses_m = 0, total_draws_m = 0;
+  std::size_t total_wins_fm = 0, total_losses_fm = 0, total_draws_fm = 0;
+
+  // Process blocks sequentially by pawn index
+  for (std::size_t pawn_idx = 0; pawn_idx < pss; ++pawn_idx) {
+    std::size_t comp_pawn_idx = companion_pawn_index(pawn_idx, m);
+
+    // Progress reporting
+    if (pawn_idx % 1000 == 0 || pawn_idx == pss - 1) {
+      auto now = std::chrono::high_resolution_clock::now();
+      auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+          now - total_start).count();
+      double pct = 100.0 * pawn_idx / pss;
+      std::cout << "\r  Block " << pawn_idx << "/" << pss
+                << " (" << std::fixed << std::setprecision(1) << pct << "%"
+                << ", " << elapsed << "s elapsed)   " << std::flush;
+    }
+
+    // Allocate block arrays
+    std::vector<Value> block_m(qss, Value::UNKNOWN);
+    std::vector<Value> block_fm(qss, Value::UNKNOWN);
+
+    // Iterative convergence within this block pair
+    bool changed = true;
+    while (changed) {
+      changed = false;
+
+      // Update block_m
+      #pragma omp parallel for schedule(dynamic, 256) reduction(||:changed)
+      for (std::size_t qi = 0; qi < qss; ++qi) {
+        if (block_m[qi] != Value::UNKNOWN) continue;
+
+        auto* mgr = thread_managers[omp_get_thread_num()].get();
+        Value new_val = compute_position_value_block(
+            qi, pawn_idx, m, fm, qss, comp_pawn_idx,
+            block_m, block_fm, tmp_fm.data, mgr);
+
+        if (new_val != Value::UNKNOWN) {
+          block_m[qi] = new_val;
+          changed = true;
+        }
+      }
+
+      // Update block_fm
+      #pragma omp parallel for schedule(dynamic, 256) reduction(||:changed)
+      for (std::size_t qi = 0; qi < qss; ++qi) {
+        if (block_fm[qi] != Value::UNKNOWN) continue;
+
+        auto* mgr = thread_managers[omp_get_thread_num()].get();
+        Value new_val = compute_position_value_block(
+            qi, comp_pawn_idx, fm, m, qss, pawn_idx,
+            block_fm, block_m, tmp_m.data, mgr);
+
+        if (new_val != Value::UNKNOWN) {
+          block_fm[qi] = new_val;
+          changed = true;
+        }
+      }
+    }
+
+    // Mark remaining UNKNOWN as DRAW, count stats
+    std::size_t wins_m = 0, losses_m = 0, draws_m = 0;
+    for (std::size_t qi = 0; qi < qss; ++qi) {
+      if (block_m[qi] == Value::UNKNOWN) block_m[qi] = Value::DRAW;
+      if (block_m[qi] == Value::WIN) wins_m++;
+      else if (block_m[qi] == Value::LOSS) losses_m++;
+      else draws_m++;
+    }
+    total_wins_m += wins_m;
+    total_losses_m += losses_m;
+    total_draws_m += draws_m;
+
+    std::size_t wins_fm = 0, losses_fm = 0, draws_fm = 0;
+    for (std::size_t qi = 0; qi < qss; ++qi) {
+      if (block_fm[qi] == Value::UNKNOWN) block_fm[qi] = Value::DRAW;
+      if (block_fm[qi] == Value::WIN) wins_fm++;
+      else if (block_fm[qi] == Value::LOSS) losses_fm++;
+      else draws_fm++;
+    }
+    total_wins_fm += wins_fm;
+    total_losses_fm += losses_fm;
+    total_draws_fm += draws_fm;
+
+    // Write to temp files
+    std::memcpy(tmp_m.data + pawn_idx * qss,
+                block_m.data(), qss * sizeof(Value));
+    std::memcpy(tmp_fm.data + comp_pawn_idx * qss,
+                block_fm.data(), qss * sizeof(Value));
+  }
+
+  auto gen_end = std::chrono::high_resolution_clock::now();
+  auto gen_duration = std::chrono::duration_cast<std::chrono::seconds>(
+      gen_end - total_start);
+
+  std::cout << "\n  Generation complete in " << gen_duration.count() << "s" << std::endl;
+  std::cout << "  " << m << ": " << total_wins_m << "W/"
+            << total_losses_m << "L/" << total_draws_m << "D" << std::endl;
+  std::cout << "  " << fm << ": " << total_wins_fm << "W/"
+            << total_losses_fm << "L/" << total_draws_fm << "D" << std::endl;
+
+  // === VERIFICATION: Verify a sample of blocks ===
+  std::cout << "  Verifying generation..." << std::endl;
+
+  {
+    std::atomic<bool> error_found{false};
+    // Verify all positions by streaming through the mmap files
+    #pragma omp parallel for schedule(dynamic, 16384)
+    for (std::size_t idx = 0; idx < total; ++idx) {
+      if (error_found.load(std::memory_order_relaxed)) continue;
+
+      Board board = index_to_board(idx, m);
+      if (has_captures(board)) continue;
+
+      std::vector<Move> moves;
+      generateMoves(board, moves);
+      if (moves.empty()) {
+        if (tmp_m.data[idx] != Value::LOSS) {
+          bool was_false = false;
+          if (error_found.compare_exchange_strong(was_false, true)) {
+            std::cerr << "\nVerification error at idx=" << idx
+                      << ": no moves but value=" << static_cast<int>(tmp_m.data[idx])
+                      << "\n";
+          }
+        }
+        continue;
+      }
+
+      auto* mgr = thread_managers[omp_get_thread_num()].get();
+
+      bool found_loss = false;
+      std::size_t num_wins_v = 0;
+
+      for (const Move& move : moves) {
+        Board next = makeMove(board, move);
+        Material next_m = get_material(next);
+        Value succ_val = Value::UNKNOWN;
+
+        if (next_m.white_pieces() == 0) {
+          succ_val = Value::LOSS;
+        } else if (next_m.black_pieces() == 0) {
+          succ_val = Value::WIN;
+        } else if (next_m == fm) {
+          succ_val = tmp_fm.data[board_to_index(next, fm)];
+        } else {
+          succ_val = mgr->lookup_wdl(next);
+        }
+
+        if (succ_val == Value::LOSS) found_loss = true;
+        else if (succ_val == Value::WIN) num_wins_v++;
+        // DRAW tracked implicitly: not LOSS and not all WIN → DRAW
+      }
+
+      Value expected;
+      if (found_loss) expected = Value::WIN;
+      else if (num_wins_v == moves.size()) expected = Value::LOSS;
+      else expected = Value::DRAW;
+
+      if (tmp_m.data[idx] != expected) {
+        bool was_false = false;
+        if (error_found.compare_exchange_strong(was_false, true)) {
+          std::cerr << "\nVerification error at idx=" << idx << " " << m
+                    << ": stored=" << static_cast<int>(tmp_m.data[idx])
+                    << " expected=" << static_cast<int>(expected) << "\n";
+        }
+      }
+    }
+
+    if (error_found.load()) {
+      std::cerr << "FATAL: Verification failed for " << m << "\n";
+      std::exit(1);
+    }
+    std::cout << "    " << m << ": OK" << std::endl;
+  }
+
+  // Verify flip(m) similarly
+  {
+    std::atomic<bool> error_found{false};
+    #pragma omp parallel for schedule(dynamic, 16384)
+    for (std::size_t idx = 0; idx < total; ++idx) {
+      if (error_found.load(std::memory_order_relaxed)) continue;
+
+      Board board = index_to_board(idx, fm);
+      if (has_captures(board)) continue;
+
+      std::vector<Move> moves;
+      generateMoves(board, moves);
+      if (moves.empty()) {
+        if (tmp_fm.data[idx] != Value::LOSS) {
+          bool was_false = false;
+          if (error_found.compare_exchange_strong(was_false, true)) {
+            std::cerr << "\nVerification error at idx=" << idx
+                      << ": no moves but value=" << static_cast<int>(tmp_fm.data[idx])
+                      << "\n";
+          }
+        }
+        continue;
+      }
+
+      auto* mgr = thread_managers[omp_get_thread_num()].get();
+
+      bool found_loss = false;
+      std::size_t num_wins_v = 0;
+
+      for (const Move& move : moves) {
+        Board next = makeMove(board, move);
+        Material next_m = get_material(next);
+        Value succ_val = Value::UNKNOWN;
+
+        if (next_m.white_pieces() == 0) {
+          succ_val = Value::LOSS;
+        } else if (next_m.black_pieces() == 0) {
+          succ_val = Value::WIN;
+        } else if (next_m == m) {
+          succ_val = tmp_m.data[board_to_index(next, m)];
+        } else {
+          succ_val = mgr->lookup_wdl(next);
+        }
+
+        if (succ_val == Value::LOSS) found_loss = true;
+        else if (succ_val == Value::WIN) num_wins_v++;
+        // DRAW tracked implicitly: not LOSS and not all WIN → DRAW
+      }
+
+      Value expected;
+      if (found_loss) expected = Value::WIN;
+      else if (num_wins_v == moves.size()) expected = Value::LOSS;
+      else expected = Value::DRAW;
+
+      if (tmp_fm.data[idx] != expected) {
+        bool was_false = false;
+        if (error_found.compare_exchange_strong(was_false, true)) {
+          std::cerr << "\nVerification error at idx=" << idx << " " << fm
+                    << ": stored=" << static_cast<int>(tmp_fm.data[idx])
+                    << " expected=" << static_cast<int>(expected) << "\n";
+        }
+      }
+    }
+
+    if (error_found.load()) {
+      std::cerr << "FATAL: Verification failed for " << fm << "\n";
+      std::exit(1);
+    }
+    std::cout << "    " << fm << ": OK" << std::endl;
+  }
+
+  // === COMPRESSION ===
+  std::cout << "  Compressing..." << std::endl;
+
+  CompressedTablebase ctb_m = compress_from_mmap(tmp_m.data, total, m);
+  CompressedTablebase ctb_fm = compress_from_mmap(tmp_fm.data, total, fm);
+
+  // Save compressed files
+  std::string filename_m = tb_directory + "/" + compressed_tablebase_filename(m);
+  save_compressed_tablebase(ctb_m, filename_m);
+
+  BlockCompressionStats bstats_m = analyze_block_compression(ctb_m);
+  std::cout << "    Saved " << filename_m << " ("
+            << bstats_m.compressed_size << " bytes, "
+            << std::fixed << std::setprecision(1)
+            << bstats_m.compression_ratio() << "x ratio)" << std::endl;
+
+  std::string filename_fm = tb_directory + "/" + compressed_tablebase_filename(fm);
+  save_compressed_tablebase(ctb_fm, filename_fm);
+
+  BlockCompressionStats bstats_fm = analyze_block_compression(ctb_fm);
+  std::cout << "    Saved " << filename_fm << " ("
+            << bstats_fm.compressed_size << " bytes, "
+            << std::fixed << std::setprecision(1)
+            << bstats_fm.compression_ratio() << "x ratio)" << std::endl;
+
+  // === VERIFY COMPRESSED LOOKUP ===
+  std::cout << "  Verifying compressed lookup..." << std::endl;
+
+  if (!verify_compressed_lookup_mmap(tmp_m.data, ctb_m, m)) {
+    std::cerr << "FATAL: Compressed lookup verification failed for " << m << "\n";
+    std::exit(1);
+  }
+  std::cout << "    " << m << ": OK" << std::endl;
+
+  if (!verify_compressed_lookup_mmap(tmp_fm.data, ctb_fm, fm)) {
+    std::cerr << "FATAL: Compressed lookup verification failed for " << fm << "\n";
+    std::exit(1);
+  }
+  std::cout << "    " << fm << ": OK" << std::endl;
+
+  auto total_end = std::chrono::high_resolution_clock::now();
+  auto total_duration = std::chrono::duration_cast<std::chrono::seconds>(
+      total_end - total_start);
+  std::cout << "  Total time: " << total_duration.count() << "s\n" << std::endl;
+
+  // Temp files cleaned up by MmapTempFile destructor
+}
+
 // Legacy single-threaded generate for compatibility
 // (Used by solve_pair which needs iterative refinement)
 std::vector<Value> generate_tablebase(
@@ -1878,10 +2460,21 @@ void solve_all_parallel_compressed(int max_pieces, int threshold, const std::str
 
     if (m.total_pieces() >= threshold) {
       // Large endgame: use compressed mode
-      std::cout << "\n[COMPRESSED] " << m;
-      if (!(f == m)) std::cout << " <-> " << f;
-      std::cout << " (" << m.total_pieces() << " pieces)" << std::endl;
-      generate_wdl_parallel_compressed(m, tb_directory);
+      // For large asymmetric materials, use block-decomposed generation
+      // to avoid exceeding available RAM
+      bool symmetric = (m == f);
+      constexpr std::size_t BLOCK_DECOMPOSE_THRESHOLD = 50ULL * 1024 * 1024 * 1024;  // 50 GB
+      bool use_block = !symmetric &&
+          (2 * material_size(m) > BLOCK_DECOMPOSE_THRESHOLD);
+
+      if (use_block) {
+        generate_wdl_block_decomposed(m, tb_directory);
+      } else {
+        std::cout << "\n[COMPRESSED] " << m;
+        if (!symmetric) std::cout << " <-> " << f;
+        std::cout << " (" << m.total_pieces() << " pieces)" << std::endl;
+        generate_wdl_parallel_compressed(m, tb_directory);
+      }
       // Force reload of the manager cache after new tablebase is saved
       check_manager.clear();
     } else {
@@ -2722,7 +3315,7 @@ int main(int argc, char* argv[]) {
     }
   } else if (remaining_argc == 3 && std::strcmp(argv[arg_offset], "--all") == 0) {
     int max_pieces = std::atoi(argv[arg_offset + 1]);
-    if (max_pieces < 2 || max_pieces > 8) {
+    if (max_pieces < 2 || max_pieces > 12) {
       std::cerr << "Max pieces must be between 2 and 8" << std::endl;
       return 1;
     }

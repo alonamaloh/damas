@@ -205,6 +205,89 @@ Board index_to_board(std::size_t idx, const Material& m) {
   return b;
 }
 
+// ============================================================================
+// Index decomposition (for block-decomposed generation)
+// ============================================================================
+
+std::size_t queen_space_size(const Material& m) {
+  int n = 32 - m.back_white_pawns - m.back_black_pawns
+            - m.other_white_pawns - m.other_black_pawns;
+  return choose(n, m.white_queens) * choose(n - m.white_queens, m.black_queens);
+}
+
+std::size_t pawn_space_size(const Material& m) {
+  std::size_t qss = queen_space_size(m);
+  if (qss == 0) return 0;
+  return material_size(m) / qss;
+}
+
+std::pair<Bb, Bb> index_to_pawn_bits(std::size_t pawn_index, const Material& m) {
+  // Extract individual pawn phase indices (reverse of mixed-radix encoding)
+  // Pawn index = i0 * [C(4,bbp)*C(24,owp)*C(24-owp,obp)]
+  //            + i1 * [C(24,owp)*C(24-owp,obp)]
+  //            + i2 * [C(24-owp,obp)]
+  //            + i3
+
+  std::size_t n_obp = choose(24 - m.other_white_pawns, m.other_black_pawns);
+  std::size_t i3 = pawn_index % n_obp;
+  pawn_index /= n_obp;
+
+  std::size_t n_owp = choose(24, m.other_white_pawns);
+  std::size_t i2 = pawn_index % n_owp;
+  pawn_index /= n_owp;
+
+  std::size_t n_bbp = choose(4, m.back_black_pawns);
+  std::size_t i1 = pawn_index % n_bbp;
+  pawn_index /= n_bbp;
+
+  std::size_t i0 = pawn_index;
+
+  // Reconstruct pawn bitboards (same logic as index_to_board, without queens)
+  Bb wp = unindex_bits(i0, m.back_white_pawns);
+  Bb bp = unindex_bits(i1, m.back_black_pawns, BACK_BLACK_MASK);
+  wp |= flip_rows(unindex_bits(i2, m.other_white_pawns, MIDDLE_MASK));
+  bp |= unindex_bits(i3, m.other_black_pawns, ~wp & MIDDLE_MASK);
+
+  return {wp, bp};
+}
+
+std::size_t pawn_bits_to_index(Bb wp, Bb bp, const Material& m) {
+  // Same indexing logic as board_to_index, but only the pawn phases
+  std::size_t i0 = index_bits(wp & BACK_WHITE_MASK);
+  std::size_t i1 = index_bits(bp & BACK_BLACK_MASK, BACK_BLACK_MASK);
+  std::size_t i2 = index_bits(flip_rows(wp) & MIDDLE_MASK, MIDDLE_MASK);
+  std::size_t i3 = index_bits(bp & MIDDLE_MASK, ~wp & MIDDLE_MASK);
+
+  // Mixed-radix combination (pawn components only)
+  std::size_t result = 0;
+  std::size_t multiplier = 1;
+
+  result += i3 * multiplier;
+  multiplier *= choose(24 - m.other_white_pawns, m.other_black_pawns);
+
+  result += i2 * multiplier;
+  multiplier *= choose(24, m.other_white_pawns);
+
+  result += i1 * multiplier;
+  multiplier *= choose(4, m.back_black_pawns);
+
+  result += i0 * multiplier;
+
+  return result;
+}
+
+std::size_t companion_pawn_index(std::size_t pawn_index, const Material& m) {
+  auto [wp, bp] = index_to_pawn_bits(pawn_index, m);
+  // Board flip: swap colors and rotate 180 degrees
+  Bb flipped_wp = flip(bp);  // black pawns become white after flip
+  Bb flipped_bp = flip(wp);  // white pawns become black after flip
+  return pawn_bits_to_index(flipped_wp, flipped_bp, flip(m));
+}
+
+// ============================================================================
+// Tablebase file I/O
+// ============================================================================
+
 // Filename for a material configuration
 std::string tablebase_filename(const Material& m) {
   std::ostringstream oss;
