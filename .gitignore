@@ -5,9 +5,24 @@ test
 generate
 lookup
 verify
+compress
+play_optimal
+play_vs_tb
+analyze_3val
+longest_mate
+main
 
 # Tablebase data files
 *.bin
+
+# Logs and temp files
+*.log
+*.txt
+nohup.out
+jnk
+
+# Editor backups
+*~
 
 # Claude Code
 .claude/
